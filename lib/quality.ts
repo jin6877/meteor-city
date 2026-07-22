@@ -10,11 +10,11 @@ export type Tier = 'high' | 'low';
 
 export interface QualityPreset {
   tier: Tier;
-  debrisCap: number; // global dynamic-fragment cap
-  maxFractureBuildings: number; // per-impact fully-fractured building cap
-  fractureCounts: number[]; // available fragment counts (coarse..fine); cache builds one template each
-  fragmentsCoarse: number; // count used for small/far buildings
-  fragmentsFine: number; // count used for large/near buildings
+  activeCap: number; // max ACTIVE (physics) debris chunks at once
+  rubbleCap: number; // max persistent static rubble instances (residue ring buffer)
+  maxFractureBuildings: number; // per-impact fully-fractured (physics) building cap
+  chunksCoarse: number; // voxel-chunk target for small/far buildings
+  chunksFine: number; // voxel-chunk target for large/near buildings
   treeFactor: number; // multiplier on generated tree count
   agentCars: number; // roaming vehicles
   agentPeds: number; // roaming pedestrians
@@ -31,11 +31,11 @@ export interface QualityPreset {
 
 const HIGH: QualityPreset = {
   tier: 'high',
-  debrisCap: 340,
-  maxFractureBuildings: 12,
-  fractureCounts: [12, 20],
-  fragmentsCoarse: 12,
-  fragmentsFine: 20,
+  activeCap: 320,
+  rubbleCap: 1500,
+  maxFractureBuildings: 10,
+  chunksCoarse: 8,
+  chunksFine: 18,
   treeFactor: 1,
   agentCars: 46,
   agentPeds: 64,
@@ -52,11 +52,11 @@ const HIGH: QualityPreset = {
 
 const LOW: QualityPreset = {
   tier: 'low',
-  debrisCap: 130,
-  maxFractureBuildings: 7,
-  fractureCounts: [9],
-  fragmentsCoarse: 9,
-  fragmentsFine: 9,
+  activeCap: 120,
+  rubbleCap: 550,
+  maxFractureBuildings: 6,
+  chunksCoarse: 6,
+  chunksFine: 10,
   treeFactor: 0.5,
   agentCars: 18,
   agentPeds: 24,

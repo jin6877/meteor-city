@@ -1,18 +1,18 @@
 /**
- * Debris system — the performance-critical core (PROJECT.md 임퍼러티브 경계).
+ * Debris system (rewritten for the reality pass).
  *
- * Rules honored:
- *  - fragments are NOT mounted as <RigidBody> JSX; bodies live in a raw Rapier
- *    world and are managed imperatively here.
- *  - rendering uses InstancedMesh POOLS (one per cached fracture fragment +
- *    one shared box for toppled buildings / chunks) -> ~25 draw calls for ALL
- *    debris regardless of count.
- *  - a hard GLOBAL cap bounds the dynamic-body count; the oldest sleeping
- *    fragments fade out then despawn so repeated drops never grow unbounded.
+ * Buildings are VOXEL-CHUNKED at their real dimensions into roughly-cubic pieces
+ * (not unit-cube fragments scaled by height — that produced tall standing
+ * slivers). So a tall tower breaks into a stack of chunky blocks and fully
+ * collapses; nothing keeps the building silhouette.
  *
- * Building size is baked into the instance matrix (non-uniform scale) and the
- * collider hull points are pre-scaled to match, so one unit-cube fragment set
- * serves every building.
+ * Two InstancedMesh pools share one unit-box geometry:
+ *  - ACTIVE: chunks with raw Rapier bodies (imperative, no JSX). The global cap
+ *    applies here (perf). Building size is baked into the per-instance matrix.
+ *  - RUBBLE: a persistent ring buffer of STATIC instances (no physics). When an
+ *    active chunk sleeps (or is forced out over cap) it is "baked" here and its
+ *    rigid body is freed — so the wreckage stays on the ground while the physics
+ *    cost is bounded. Overflow buildings collapse straight to rubble piles.
  */
 import {
   Color,
@@ -23,440 +23,393 @@ import {
   Quaternion,
   Vector3,
   BoxGeometry,
+  Euler,
   DynamicDrawUsage,
 } from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
-import type { FractureTemplate } from './fracture';
 
 type RWorld = InstanceType<typeof RAPIER.World>;
 type RBody = InstanceType<typeof RAPIER.RigidBody>;
 
-interface Debris {
+interface Chunk {
   body: RBody;
-  mesh: number; // index into this.meshes
   slot: number;
   size: [number, number, number];
   baseColor: Color;
   hotColor: Color;
   born: number;
-  hot: number; // seconds of hot glow remaining
   hotDur: number;
-  fading: boolean;
-  fadeStart: number;
-  bigChunk: boolean;
 }
 
-const FADE_DUR = 0.55;
-const MAX_AGE = 32; // sleeping debris older than this begins to fade
 const _m4 = new Matrix4();
 const _q = new Quaternion();
 const _p = new Vector3();
 const _s = new Vector3();
 const _c = new Color();
 const _dir = new Vector3();
+const _axis = new Vector3();
+const _e = new Euler();
+const CULL_Y = -28;
 
 export interface DebrisOptions {
-  cap: number;
-  templates: FractureTemplate[];
+  activeCap: number;
+  rubbleCap: number;
   castShadow: boolean;
 }
 
 export class DebrisSystem {
   readonly group = new Group();
   private world: RWorld;
-  private cap: number;
-  private templates: FractureTemplate[];
-  private meshes: InstancedMesh[] = [];
-  private freeStacks: number[][] = [];
-  private maxSlot: number[] = [];
-  private caps: number[] = [];
+  private activeCap: number;
+  private rubbleCap: number;
   private material: MeshStandardMaterial;
-  private boxMeshIndex = 0;
-  private protoOffsets: number[] = []; // template -> starting mesh index
-  private active: Debris[] = [];
+  private activeMesh: InstancedMesh;
+  private rubbleMesh: InstancedMesh;
+
+  private active: Chunk[] = [];
+  private activeFree: number[] = [];
+  private activeMaxSlot = -1;
+
+  private rubbleCursor = 0;
+  private rubbleCount = 0;
   private simTime = 0;
 
   constructor(world: RWorld, opts: DebrisOptions) {
     this.world = world;
-    this.cap = opts.cap;
-    this.templates = opts.templates;
+    this.activeCap = opts.activeCap;
+    this.rubbleCap = opts.rubbleCap;
     this.group.name = 'debris';
 
-    this.material = new MeshStandardMaterial({
-      roughness: 0.72,
-      metalness: 0.05,
-      vertexColors: false,
-    });
+    this.material = new MeshStandardMaterial({ roughness: 0.82, metalness: 0.02 });
+    const geo = new BoxGeometry(1, 1, 1);
 
-    // a single proto can be used by up to (cap / smallestFragmentCount) buildings
-    const minCount = Math.max(
-      1,
-      Math.min(...this.templates.map((t) => t.protos.length || t.count)),
-    );
-    const perProto = Math.max(8, Math.ceil(this.cap / minCount) + 8);
-
-    // meshes[0] = shared unit box (toppled buildings + chunks), capacity = cap
-    const boxGeo = new BoxGeometry(1, 1, 1);
-    const box = new InstancedMesh(boxGeo, this.material, this.cap);
-    box.castShadow = opts.castShadow;
-    box.receiveShadow = true;
-    box.frustumCulled = false;
-    box.instanceMatrix.setUsage(DynamicDrawUsage);
-    box.count = 0;
-    this.registerMesh(box, this.cap);
-
-    // fracture proto instanced meshes
-    for (let t = 0; t < this.templates.length; t++) {
-      this.protoOffsets[t] = this.meshes.length;
-      for (const proto of this.templates[t].protos) {
-        const im = new InstancedMesh(proto.geometry, this.material, perProto);
-        im.castShadow = opts.castShadow;
-        im.receiveShadow = true;
-        im.frustumCulled = false;
-        im.instanceMatrix.setUsage(DynamicDrawUsage);
-        im.count = 0;
-        this.registerMesh(im, perProto);
-      }
+    this.activeMesh = new InstancedMesh(geo, this.material, this.activeCap);
+    this.rubbleMesh = new InstancedMesh(geo, this.material, this.rubbleCap);
+    for (const m of [this.activeMesh, this.rubbleMesh]) {
+      m.castShadow = opts.castShadow;
+      m.receiveShadow = true;
+      m.frustumCulled = false;
+      m.instanceMatrix.setUsage(DynamicDrawUsage);
+      m.count = 0;
     }
-  }
+    // prime instanceColor attributes
+    this.activeMesh.setColorAt(0, _c.set(0xffffff));
+    this.rubbleMesh.setColorAt(0, _c.set(0xffffff));
 
-  private registerMesh(im: InstancedMesh, capacity: number) {
-    const idx = this.meshes.length;
-    this.meshes.push(im);
-    const stack: number[] = [];
-    for (let i = capacity - 1; i >= 0; i--) stack.push(i);
-    this.freeStacks.push(stack);
-    this.maxSlot.push(-1);
-    this.caps.push(capacity);
-    // start hidden
-    _m4.makeScale(0, 0, 0);
-    for (let i = 0; i < capacity; i++) im.setMatrixAt(i, _m4);
-    im.instanceMatrix.needsUpdate = true;
-    this.group.add(im);
-    return idx;
+    for (let i = this.activeCap - 1; i >= 0; i--) this.activeFree.push(i);
+    this.group.add(this.activeMesh, this.rubbleMesh);
   }
 
   get count(): number {
     return this.active.length;
   }
+  get rubble(): number {
+    return this.rubbleCount;
+  }
 
-  private alloc(meshIndex: number): number {
-    const stack = this.freeStacks[meshIndex];
-    if (stack.length === 0) return -1;
-    const slot = stack.pop()!;
-    if (slot > this.maxSlot[meshIndex]) {
-      this.maxSlot[meshIndex] = slot;
-      this.meshes[meshIndex].count = slot + 1;
+  // ---------- active pool ----------
+  private allocActive(): number {
+    const slot = this.activeFree.pop();
+    if (slot === undefined) return -1;
+    if (slot > this.activeMaxSlot) {
+      this.activeMaxSlot = slot;
+      this.activeMesh.count = slot + 1;
     }
     return slot;
   }
 
-  private release(meshIndex: number, slot: number) {
-    this.freeStacks[meshIndex].push(slot);
+  private freeActiveSlot(slot: number) {
+    this.activeFree.push(slot);
     _m4.makeScale(0, 0, 0);
-    this.meshes[meshIndex].setMatrixAt(slot, _m4);
-    this.meshes[meshIndex].instanceMatrix.needsUpdate = true;
+    this.activeMesh.setMatrixAt(slot, _m4);
   }
 
-  private removeEntry(index: number) {
+  // ---------- rubble ring buffer (persistent residue) ----------
+  private bake(
+    px: number, py: number, pz: number,
+    qx: number, qy: number, qz: number, qw: number,
+    sx: number, sy: number, sz: number,
+    color: Color,
+  ) {
+    const slot = this.rubbleCursor;
+    _p.set(px, py, pz);
+    _q.set(qx, qy, qz, qw);
+    _s.set(sx, sy, sz);
+    _m4.compose(_p, _q, _s);
+    this.rubbleMesh.setMatrixAt(slot, _m4);
+    this.rubbleMesh.setColorAt(slot, color);
+    this.rubbleCursor = (this.rubbleCursor + 1) % this.rubbleCap;
+    this.rubbleCount = Math.min(this.rubbleCap, this.rubbleCount + 1);
+    this.rubbleMesh.count = this.rubbleCount;
+    this.rubbleMesh.instanceMatrix.needsUpdate = true;
+    if (this.rubbleMesh.instanceColor) this.rubbleMesh.instanceColor.needsUpdate = true;
+  }
+
+  /** Bake an active chunk into static rubble and free its rigid body. */
+  private bakeActive(index: number) {
+    const e = this.active[index];
+    const t = e.body.translation();
+    const r = e.body.rotation();
+    this.bake(t.x, t.y, t.z, r.x, r.y, r.z, r.w, e.size[0], e.size[1], e.size[2], e.baseColor);
+    try {
+      this.world.removeRigidBody(e.body);
+    } catch {
+      /* noop */
+    }
+    this.freeActiveSlot(e.slot);
+    this.active.splice(index, 1);
+  }
+
+  private cullActive(index: number) {
     const e = this.active[index];
     try {
       this.world.removeRigidBody(e.body);
     } catch {
-      /* body may already be gone */
+      /* noop */
     }
-    this.release(e.mesh, e.slot);
+    this.freeActiveSlot(e.slot);
     this.active.splice(index, 1);
   }
 
   private ensureRoom() {
-    // hard ceiling: never exceed cap live bodies
-    while (this.active.length >= this.cap) {
-      this.removeEntry(0); // oldest
+    // hard ceiling on ACTIVE physics bodies — freeze the oldest into rubble
+    while (this.active.length >= this.activeCap) {
+      this.bakeActive(0);
     }
   }
 
-  private spawnBody(
-    meshIndex: number,
-    colliderDesc: InstanceType<typeof RAPIER.ColliderDesc>,
+  private spawnChunk(
     pos: [number, number, number],
     size: [number, number, number],
-    baseColor: number,
+    color: number,
     hotColor: number,
     hotDur: number,
-    linvel: [number, number, number],
-    angvel: [number, number, number],
-    bigChunk: boolean,
+    lin: [number, number, number],
+    ang: [number, number, number],
   ): boolean {
     this.ensureRoom();
-    const slot = this.alloc(meshIndex);
+    const slot = this.allocActive();
     if (slot < 0) return false;
-
     const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(pos[0], pos[1], pos[2])
       .setCanSleep(true)
-      .setLinearDamping(0.06)
-      .setAngularDamping(0.25);
+      .setLinearDamping(0.05)
+      .setAngularDamping(0.3);
     const body = this.world.createRigidBody(bodyDesc);
-    colliderDesc.setRestitution(0.12).setFriction(0.85).setDensity(1.4);
-    this.world.createCollider(colliderDesc, body);
-    body.setLinvel({ x: linvel[0], y: linvel[1], z: linvel[2] }, true);
-    body.setAngvel({ x: angvel[0], y: angvel[1], z: angvel[2] }, true);
-
-    const e: Debris = {
+    this.world.createCollider(
+      RAPIER.ColliderDesc.cuboid(size[0] / 2, size[1] / 2, size[2] / 2)
+        .setRestitution(0.08)
+        .setFriction(0.6) // lower so chunks slide/topple into flat piles, not standing stacks
+        .setDensity(1.6),
       body,
-      mesh: meshIndex,
+    );
+    body.setLinvel({ x: lin[0], y: lin[1], z: lin[2] }, true);
+    body.setAngvel({ x: ang[0], y: ang[1], z: ang[2] }, true);
+
+    const e: Chunk = {
+      body,
       slot,
       size,
-      baseColor: new Color(baseColor),
+      baseColor: new Color(color),
       hotColor: new Color(hotColor),
       born: this.simTime,
-      hot: hotDur,
       hotDur,
-      fading: false,
-      fadeStart: 0,
-      bigChunk,
     };
     this.active.push(e);
-    // initial transform + color
-    this.writeInstance(e, 1);
-    const im = this.meshes[meshIndex];
-    _c.copy(hotDur > 0 ? e.hotColor : e.baseColor);
-    im.setColorAt(slot, _c);
-    if (im.instanceColor) im.instanceColor.needsUpdate = true;
+    this.writeActive(e);
+    this.activeMesh.setColorAt(slot, hotDur > 0 ? e.hotColor : e.baseColor);
+    if (this.activeMesh.instanceColor) this.activeMesh.instanceColor.needsUpdate = true;
     return true;
   }
 
-  private writeInstance(e: Debris, fade: number) {
+  private writeActive(e: Chunk) {
     const t = e.body.translation();
     const r = e.body.rotation();
     _p.set(t.x, t.y, t.z);
     _q.set(r.x, r.y, r.z, r.w);
-    _s.set(e.size[0] * fade, e.size[1] * fade, e.size[2] * fade);
+    _s.set(e.size[0], e.size[1], e.size[2]);
     _m4.compose(_p, _q, _s);
-    this.meshes[e.mesh].setMatrixAt(e.slot, _m4);
-  }
-
-  /** Pick the cached template whose fragment count is closest to desired. */
-  private pickTemplate(desiredCount: number): number {
-    let best = 0;
-    let bestD = Infinity;
-    for (let i = 0; i < this.templates.length; i++) {
-      const d = Math.abs(this.templates[i].count - desiredCount);
-      if (d < bestD) {
-        bestD = d;
-        best = i;
-      }
-    }
-    return best;
+    this.activeMesh.setMatrixAt(e.slot, _m4);
   }
 
   /**
-   * Core/blast zone: fracture a building into fragment bodies with radial
-   * impulse. desiredCount drives detail — bigger/nearer buildings pass a higher
-   * count so they shatter into more pieces (size/zone-proportional).
+   * Voxel-chunk a building into roughly-cubic physics pieces (item 1). desired
+   * ~= target piece count; a cubic cell size is derived so tall buildings get
+   * multiple vertical layers and pieces never become tall slivers.
    */
   fractureBuilding(
-    center: [number, number, number], // footprint center, base y
-    size: [number, number, number], // w,h,d
+    center: [number, number, number],
+    size: [number, number, number],
     color: number,
     impact: Vector3,
     impulse: number,
     hotColor: number,
-    jitter: number, // 0..1 asymmetry (jagged)
-    desiredCount: number,
+    jitter: number,
+    desired: number,
   ): number {
-    const templateIdx = this.pickTemplate(desiredCount);
-    const template = this.templates[templateIdx];
-    const meshBase = this.protoOffsets[templateIdx];
     const [w, h, d] = size;
-    const bodyPos: [number, number, number] = [center[0], center[1] + h / 2, center[2]];
+    const vol = Math.max(1, w * h * d);
+    let s = Math.cbrt(vol / Math.max(2, desired));
+    s = Math.max(2.0, s); // don't shatter into confetti
+    const nx = Math.max(1, Math.min(3, Math.round(w / s)));
+    const ny = Math.max(1, Math.min(14, Math.round(h / s)));
+    const nz = Math.max(1, Math.min(3, Math.round(d / s)));
+    const cw = w / nx, ch = h / ny, cd = d / nz;
+    const baseX = center[0] - w / 2;
+    const baseZ = center[2] - d / 2;
     let spawned = 0;
 
-    for (let i = 0; i < template.protos.length; i++) {
-      const proto = template.protos[i];
-      // scale unit hull to building size
-      const scaled = new Float32Array(proto.hull.length);
-      for (let k = 0; k < proto.hull.length; k += 3) {
-        scaled[k] = proto.hull[k] * w;
-        scaled[k + 1] = proto.hull[k + 1] * h;
-        scaled[k + 2] = proto.hull[k + 2] * d;
-      }
-      const colDesc = RAPIER.ColliderDesc.convexHull(scaled);
-      if (!colDesc) continue;
+    for (let ix = 0; ix < nx; ix++) {
+      for (let iy = 0; iy < ny; iy++) {
+        for (let iz = 0; iz < nz; iz++) {
+          const px = baseX + (ix + 0.5) * cw;
+          const py = center[1] + (iy + 0.5) * ch;
+          const pz = baseZ + (iz + 0.5) * cd;
+          const jx = 0.82 + Math.random() * 0.16;
+          const cs: [number, number, number] = [cw * jx, ch * jx, cd * jx];
 
-      // fragment world center for impulse direction
-      _dir
-        .set(
-          bodyPos[0] + proto.centroid[0] * w,
-          bodyPos[1] + proto.centroid[1] * h,
-          bodyPos[2] + proto.centroid[2] * d,
-        )
-        .sub(impact);
-      const dist = Math.max(0.6, _dir.length());
-      _dir.normalize();
-      const speed = (impulse * 18) / Math.sqrt(dist);
-      const jx = (Math.random() - 0.5) * jitter * speed;
-      const jz = (Math.random() - 0.5) * jitter * speed;
-      const lin: [number, number, number] = [
-        _dir.x * speed + jx,
-        _dir.y * speed + Math.abs(speed) * 0.35 + 2,
-        _dir.z * speed + jz,
-      ];
-      const ang: [number, number, number] = [
-        (Math.random() - 0.5) * 8,
-        (Math.random() - 0.5) * 8,
-        (Math.random() - 0.5) * 8,
-      ];
-      if (
-        this.spawnBody(
-          meshBase + i,
-          colDesc,
-          bodyPos,
-          size,
-          color,
-          hotColor,
-          1.4,
-          lin,
-          ang,
-          true,
-        )
-      ) {
-        spawned++;
+          _dir.set(px - impact.x, py - impact.y, pz - impact.z);
+          const dist = Math.max(0.7, _dir.length());
+          _dir.normalize();
+          const speed = (impulse * 16) / Math.sqrt(dist);
+          const asym = (Math.random() - 0.5) * jitter * speed;
+          // structural splay: every chunk is shoved OUTWARD from the building's
+          // own vertical axis (more up high) so the whole tower collapses even
+          // when the meteor struck only the top — no standing base stack.
+          _axis.set(px - center[0], 0, pz - center[2]);
+          if (_axis.lengthSq() < 0.01) _axis.set(Math.random() - 0.5, 0, Math.random() - 0.5);
+          _axis.normalize();
+          const splay = 2.5 + (py - center[1]) * 0.14;
+          const lin: [number, number, number] = [
+            _dir.x * speed + asym + _axis.x * splay,
+            Math.abs(_dir.y) * speed * 0.4 + speed * 0.25 + 1,
+            _dir.z * speed + (Math.random() - 0.5) * jitter * speed + _axis.z * splay,
+          ];
+          const ang: [number, number, number] = [
+            (Math.random() - 0.5) * 9,
+            (Math.random() - 0.5) * 9,
+            (Math.random() - 0.5) * 9,
+          ];
+          // only near/lower chunks glow hot
+          const hot = dist < 14 ? 1.2 : 0;
+          if (this.spawnChunk([px, py, pz], cs, color, hotColor, hot, lin, ang)) spawned++;
+        }
       }
     }
     return spawned;
   }
 
-  /** Blast zone: topple an intact building as a single dynamic box. */
-  toppleBuilding(
-    center: [number, number, number],
-    size: [number, number, number],
-    color: number,
-    impact: Vector3,
-  ): boolean {
-    const [w, h, d] = size;
-    const bodyPos: [number, number, number] = [center[0], center[1] + h / 2, center[2]];
-    _dir.set(bodyPos[0] - impact.x, 0, bodyPos[2] - impact.z);
-    const dist = Math.max(1, _dir.length());
-    _dir.normalize();
-    const push = 60 / Math.sqrt(dist);
-    const lin: [number, number, number] = [_dir.x * push, 4, _dir.z * push];
-    // torque so it tips away from impact
-    const ang: [number, number, number] = [_dir.z * 1.6, 0, -_dir.x * 1.6];
-    const colDesc = RAPIER.ColliderDesc.cuboid(w / 2, h / 2, d / 2);
-    return this.spawnBody(
-      this.boxMeshIndex,
-      colDesc,
-      bodyPos,
-      size,
-      color,
-      color,
-      0,
-      lin,
-      ang,
-      true,
-    );
-  }
-
-  /** Small ejected chunk (used sparingly in blast zone). */
-  spawnChunk(
+  /** A single ejected chunk (e.g. a toppled tree flung by the blast). */
+  spawnFlyingChunk(
     pos: [number, number, number],
     s: number,
     color: number,
     impact: Vector3,
-    hotColor: number,
+    hotColor = color,
   ): boolean {
     _dir.set(pos[0] - impact.x, pos[1] - impact.y, pos[2] - impact.z);
     const dist = Math.max(0.5, _dir.length());
     _dir.normalize();
-    const speed = 40 / Math.sqrt(dist);
-    const lin: [number, number, number] = [
-      _dir.x * speed,
-      Math.abs(speed) * 0.6 + 4,
-      _dir.z * speed,
-    ];
+    const speed = 34 / Math.sqrt(dist);
+    const lin: [number, number, number] = [_dir.x * speed, Math.abs(speed) * 0.6 + 5, _dir.z * speed];
     const ang: [number, number, number] = [
       (Math.random() - 0.5) * 12,
       (Math.random() - 0.5) * 12,
       (Math.random() - 0.5) * 12,
     ];
-    const colDesc = RAPIER.ColliderDesc.cuboid(s / 2, s / 2, s / 2);
-    return this.spawnBody(
-      this.boxMeshIndex,
-      colDesc,
-      pos,
-      [s, s, s],
-      color,
-      hotColor,
-      0.9,
-      lin,
-      ang,
-      false,
-    );
+    return this.spawnChunk(pos, [s, s * 1.4, s], color, hotColor, 0, lin, ang);
   }
 
-  /** Per fixed-step: advance ages/fades, then sync instance transforms. */
+  /**
+   * Collapse a building straight into a static rubble pile (no physics) — used
+   * for the far overflow of a big blast so residue appears everywhere without
+   * spawning hundreds of bodies.
+   */
+  collapseToRubble(
+    center: [number, number, number],
+    size: [number, number, number],
+    color: number,
+  ) {
+    const [w, h, d] = size;
+    const n = 4 + (h > 26 ? 3 : 0);
+    const c = new Color(color);
+    for (let i = 0; i < n; i++) {
+      const sx = w * (0.28 + Math.random() * 0.3);
+      const sy = Math.min(h, Math.max(w, d)) * (0.22 + Math.random() * 0.28);
+      const sz = d * (0.28 + Math.random() * 0.3);
+      const px = center[0] + (Math.random() - 0.5) * w * 0.7;
+      const pz = center[2] + (Math.random() - 0.5) * d * 0.7;
+      const py = center[1] + sy / 2 + Math.random() * Math.min(h * 0.12, 2);
+      _e.set(
+        (Math.random() - 0.5) * 0.6,
+        Math.random() * Math.PI,
+        (Math.random() - 0.5) * 0.6,
+      );
+      _q.setFromEuler(_e);
+      this.bake(px, py, pz, _q.x, _q.y, _q.z, _q.w, sx, sy, sz, c);
+    }
+  }
+
+  /** Bake a tiny rubble mound where a felled tree stood (residue). */
+  treeStump(x: number, z: number, scale: number, color: number) {
+    const c = new Color(color);
+    this.bake(x, 0.4 * scale, z, 0, 0, 0, 1, 1.6 * scale, 0.7 * scale, 1.6 * scale, c);
+  }
+
   update(simTime: number) {
     this.simTime = simTime;
-    const dirtyM = new Set<number>();
-    const dirtyC = new Set<number>();
-
-    // age-out oldest sleeping debris when crowded or too old
-    const crowded = this.active.length > this.cap * 0.8;
-    for (let i = 0; i < this.active.length; i++) {
-      const e = this.active[i];
-      if (e.fading) continue;
-      const age = simTime - e.born;
-      const sleeping = e.body.isSleeping();
-      if ((crowded && sleeping && i < this.active.length * 0.25) || age > MAX_AGE) {
-        e.fading = true;
-        e.fadeStart = simTime;
-      }
-    }
-
+    let anyMatrix = false;
+    let anyColor = false;
     for (let i = this.active.length - 1; i >= 0; i--) {
       const e = this.active[i];
-      let fade = 1;
-      if (e.fading) {
-        const f = (simTime - e.fadeStart) / FADE_DUR;
-        if (f >= 1) {
-          this.removeEntry(i);
-          dirtyM.add(e.mesh);
-          continue;
-        }
-        fade = 1 - f;
+      const t = e.body.translation();
+      if (t.y < CULL_Y) {
+        this.cullActive(i);
+        anyMatrix = true;
+        continue;
       }
-      this.writeInstance(e, fade);
-      dirtyM.add(e.mesh);
-
-      // hot -> cool color ramp for freshly fractured chunks (DESIGN §4-3 발광 냉각)
-      if (e.hot > 0) {
-        const remain = Math.max(0, e.hotDur - (simTime - e.born));
-        e.hot = e.hotDur > 0 ? remain / e.hotDur : 0;
-        _c.copy(e.baseColor).lerp(e.hotColor, e.hot);
-        this.meshes[e.mesh].setColorAt(e.slot, _c);
-        dirtyC.add(e.mesh);
+      if (e.body.isSleeping()) {
+        this.bakeActive(i); // settle -> persistent rubble, free the body
+        anyMatrix = true;
+        continue;
+      }
+      this.writeActive(e);
+      anyMatrix = true;
+      if (e.hotDur > 0) {
+        const k = Math.max(0, 1 - (simTime - e.born) / e.hotDur);
+        if (k <= 0) e.hotDur = 0;
+        _c.copy(e.baseColor).lerp(e.hotColor, k);
+        this.activeMesh.setColorAt(e.slot, _c);
+        anyColor = true;
       }
     }
-
-    for (const m of dirtyM) this.meshes[m].instanceMatrix.needsUpdate = true;
-    for (const m of dirtyC) {
-      const ic = this.meshes[m].instanceColor;
-      if (ic) ic.needsUpdate = true;
+    if (anyMatrix) this.activeMesh.instanceMatrix.needsUpdate = true;
+    if (anyColor && this.activeMesh.instanceColor) {
+      this.activeMesh.instanceColor.needsUpdate = true;
     }
   }
 
   reset() {
-    for (let i = this.active.length - 1; i >= 0; i--) this.removeEntry(i);
+    for (let i = this.active.length - 1; i >= 0; i--) {
+      try {
+        this.world.removeRigidBody(this.active[i].body);
+      } catch {
+        /* noop */
+      }
+    }
     this.active.length = 0;
+    this.activeFree.length = 0;
+    for (let i = this.activeCap - 1; i >= 0; i--) this.activeFree.push(i);
+    this.activeMaxSlot = -1;
+    this.activeMesh.count = 0;
+    this.rubbleCursor = 0;
+    this.rubbleCount = 0;
+    this.rubbleMesh.count = 0;
   }
 
   dispose() {
     this.reset();
-    for (const im of this.meshes) {
-      im.geometry.dispose();
-    }
+    this.activeMesh.geometry.dispose();
     this.material.dispose();
     this.group.clear();
   }
