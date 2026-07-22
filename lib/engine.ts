@@ -285,6 +285,8 @@ export class Engine {
     } else {
       this.fx.crater([t.x, 0.1, t.z], preset, mt.overWater);
       this.embedMeteor(mt, t.x, t.z);
+      // main blaze at the crater — bigger blasts burn bigger/longer (comet frosts)
+      this.fx.ignite([t.x, 0.5, t.z], mt.resolved.R1, preset.dustCool);
     }
     this.onImpact?.(impact, mt.resolved);
   }
@@ -343,6 +345,8 @@ export class Engine {
     hit.sort((a, b) => a.d - b.d);
 
     const maxF = this.quality.maxFractureBuildings;
+    let firesLit = 0;
+    const maxFires = 4; // per impact — fires accumulate across hits up to the site cap
     for (let i = 0; i < hit.length; i++) {
       const c = hit[i];
       const info = this.city.infos.get(c.id)!;
@@ -364,6 +368,11 @@ export class Engine {
         );
       } else {
         this.debris.collapseToRubble(info.center, info.size, info.color);
+      }
+      // scatter a few blazes across the leveled footprints (comet frosts instead)
+      if (firesLit < maxFires && c.d < R2 * 0.75) {
+        this.fx.ignite([info.center[0], 0.5, info.center[2]], R1 * 0.55, preset.dustCool);
+        firesLit++;
       }
     }
 
@@ -434,6 +443,7 @@ export class Engine {
       this.agents = null;
     }
     this.debris?.dispose();
+    this.fx.dispose();
     // Rapier world has no explicit free in compat; drop references
     this.world = null;
     this.ready = false;
