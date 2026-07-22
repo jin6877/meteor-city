@@ -1,30 +1,44 @@
 /**
- * Debris system (rewritten for the reality pass).
+ * Debris system (reality pass + irregular-shape pass).
  *
  * Buildings are VOXEL-CHUNKED at their real dimensions into roughly-cubic pieces
  * (not unit-cube fragments scaled by height — that produced tall standing
  * slivers). So a tall tower breaks into a stack of chunky blocks and fully
  * collapses; nothing keeps the building silhouette.
  *
- * Two InstancedMesh pools share one unit-box geometry:
+ * IRREGULAR SHAPES (feedback 1): pieces are no longer perfect cubes. Instead of
+ * one shared box geometry we build a handful of ANGULAR shard geometries (jittered
+ * boxes, a flat slab, an icosa/dodeca rock). Each variant gets its own
+ * InstancedMesh (still just a few draw calls, per-instance matrices carry the
+ * variety). Every chunk picks a random variant, a random rotation, a NON-uniform
+ * scale, and a slightly jittered color — so no two look alike and the "repeated
+ * cube" tell is gone. The voxel grid itself splits into UNEVEN cells so chunk
+ * sizes span small shards to big lumps.
+ *
+ * Two families of pools share one material:
  *  - ACTIVE: chunks with raw Rapier bodies (imperative, no JSX). The global cap
- *    applies here (perf). Building size is baked into the per-instance matrix.
- *  - RUBBLE: a persistent ring buffer of STATIC instances (no physics). When an
+ *    applies here (perf). Collider stays a cheap cuboid; the visual shard is the
+ *    fancy part. Building size is baked into the per-instance matrix.
+ *  - RUBBLE: persistent ring buffers of STATIC instances (no physics). When an
  *    active chunk sleeps (or is forced out over cap) it is "baked" here and its
- *    rigid body is freed — so the wreckage stays on the ground while the physics
- *    cost is bounded. Overflow buildings collapse straight to rubble piles.
+ *    rigid body freed — wreckage stays on the ground at bounded physics cost.
+ *    Overflow buildings collapse straight to messy rubble piles.
  */
 import {
+  BufferAttribute,
+  BufferGeometry,
+  BoxGeometry,
   Color,
+  DodecahedronGeometry,
+  DynamicDrawUsage,
+  Euler,
   Group,
+  IcosahedronGeometry,
   InstancedMesh,
   Matrix4,
   MeshStandardMaterial,
   Quaternion,
   Vector3,
-  BoxGeometry,
-  Euler,
-  DynamicDrawUsage,
 } from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 
@@ -33,6 +47,7 @@ type RBody = InstanceType<typeof RAPIER.RigidBody>;
 
 interface Chunk {
   body: RBody;
+  variant: number;
   slot: number;
   size: [number, number, number];
   baseColor: Color;
@@ -43,6 +58,7 @@ interface Chunk {
 
 const _m4 = new Matrix4();
 const _q = new Quaternion();
+const _q2 = new Quaternion();
 const _p = new Vector3();
 const _s = new Vector3();
 const _c = new Color();
@@ -50,6 +66,83 @@ const _dir = new Vector3();
 const _axis = new Vector3();
 const _e = new Euler();
 const CULL_Y = -28;
+
+// ---------- irregular shard geometries (built once) ----------
+/**
+ * Jitter a base solid into an angular shard, then normalize its bounds to a unit
+ * cube centered on the origin so a per-instance [w,h,d] scale maps cleanly to the
+ * chunk's cell. Corners are grouped by position so the solid stays closed, then
+ * flattened to non-indexed for faceted, AO-catching facets.
+ */
+function angularShard(base: BufferGeometry, amt: number): BufferGeometry {
+  const pos = base.getAttribute('position') as BufferAttribute;
+  const groups = new Map<string, number[]>();
+  for (let i = 0; i < pos.count; i++) {
+    const k = `${pos.getX(i).toFixed(2)}_${pos.getY(i).toFixed(2)}_${pos.getZ(i).toFixed(2)}`;
+    let arr = groups.get(k);
+    if (!arr) {
+      arr = [];
+      groups.set(k, arr);
+    }
+    arr.push(i);
+  }
+  for (const arr of groups.values()) {
+    const dx = (Math.random() - 0.5) * amt;
+    const dy = (Math.random() - 0.5) * amt;
+    const dz = (Math.random() - 0.5) * amt;
+    for (const i of arr) pos.setXYZ(i, pos.getX(i) + dx, pos.getY(i) + dy, pos.getZ(i) + dz);
+  }
+  base.computeBoundingBox();
+  const bb = base.boundingBox!;
+  const cx = (bb.min.x + bb.max.x) / 2;
+  const cy = (bb.min.y + bb.max.y) / 2;
+  const cz = (bb.min.z + bb.max.z) / 2;
+  const maxE = Math.max(bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z) || 1;
+  for (let i = 0; i < pos.count; i++) {
+    pos.setXYZ(i, (pos.getX(i) - cx) / maxE, (pos.getY(i) - cy) / maxE, (pos.getZ(i) - cz) / maxE);
+  }
+  pos.needsUpdate = true;
+  // faceted normals; polyhedra come non-indexed already, boxes need converting
+  const flat = base.index ? base.toNonIndexed() : base;
+  flat.computeVertexNormals();
+  if (flat !== base) base.dispose();
+  return flat;
+}
+
+/** A few genuinely different angular silhouettes — chunks mix these at random. */
+function makeShardGeometries(): BufferGeometry[] {
+  return [
+    angularShard(new BoxGeometry(1, 1, 1), 0.26), // chunky angular block
+    angularShard(new BoxGeometry(1, 1, 1), 0.52), // more broken block
+    angularShard(new BoxGeometry(1.25, 0.6, 1.0), 0.34), // flat slab shard
+    angularShard(new IcosahedronGeometry(0.62, 0), 0.34), // angular rock
+    angularShard(new DodecahedronGeometry(0.6, 0), 0.3), // chunky faceted rock
+  ];
+}
+
+/** Subtle per-instance color variety (brightness + tiny channel drift, no rainbow). */
+function jitterColorInPlace(c: Color, amt: number) {
+  const f = 1 + (Math.random() - 0.5) * amt;
+  const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
+  c.setRGB(
+    clamp01(c.r * f * (1 + (Math.random() - 0.5) * amt * 0.5)),
+    clamp01(c.g * f * (1 + (Math.random() - 0.5) * amt * 0.5)),
+    clamp01(c.b * f * (1 + (Math.random() - 0.5) * amt * 0.5)),
+  );
+}
+
+/** Split a length into `n` UNEVEN segments (summing to total) for varied chunk sizes. */
+function splitAxis(total: number, n: number): number[] {
+  if (n <= 1) return [total];
+  const w: number[] = [];
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const g = 0.55 + Math.random() * 0.9; // some cells much smaller/larger than average
+    w.push(g);
+    sum += g;
+  }
+  return w.map((g) => (total * g) / sum);
+}
 
 export interface DebrisOptions {
   activeCap: number;
@@ -61,88 +154,115 @@ export class DebrisSystem {
   readonly group = new Group();
   private world: RWorld;
   private activeCap: number;
-  private rubbleCap: number;
+  private rubbleSlots: number; // per-variant rubble ring capacity
   private material: MeshStandardMaterial;
-  private activeMesh: InstancedMesh;
-  private rubbleMesh: InstancedMesh;
+  private geometries: BufferGeometry[];
+  private variantCount: number;
+
+  private activeMeshes: InstancedMesh[] = [];
+  private rubbleMeshes: InstancedMesh[] = [];
 
   private active: Chunk[] = [];
-  private activeFree: number[] = [];
-  private activeMaxSlot = -1;
+  private activeFree: number[][] = []; // free slots per variant
+  private activeMaxSlot: number[] = [];
 
-  private rubbleCursor = 0;
-  private rubbleCount = 0;
+  private rubbleCursor: number[] = [];
+  private rubbleCount: number[] = [];
+
+  private _dirtyM: boolean[];
+  private _dirtyC: boolean[];
   private simTime = 0;
 
   constructor(world: RWorld, opts: DebrisOptions) {
     this.world = world;
     this.activeCap = opts.activeCap;
-    this.rubbleCap = opts.rubbleCap;
     this.group.name = 'debris';
 
-    this.material = new MeshStandardMaterial({ roughness: 0.82, metalness: 0.02 });
-    const geo = new BoxGeometry(1, 1, 1);
+    this.material = new MeshStandardMaterial({
+      roughness: 0.85,
+      metalness: 0.02,
+      flatShading: true, // reinforce the faceted, non-plastic shard look
+    });
+    this.geometries = makeShardGeometries();
+    this.variantCount = this.geometries.length;
+    // total rubble capacity across variants stays <= rubbleCap
+    this.rubbleSlots = Math.max(1, Math.floor(opts.rubbleCap / this.variantCount));
+    this._dirtyM = new Array(this.variantCount).fill(false);
+    this._dirtyC = new Array(this.variantCount).fill(false);
 
-    this.activeMesh = new InstancedMesh(geo, this.material, this.activeCap);
-    this.rubbleMesh = new InstancedMesh(geo, this.material, this.rubbleCap);
-    for (const m of [this.activeMesh, this.rubbleMesh]) {
-      m.castShadow = opts.castShadow;
-      m.receiveShadow = true;
-      m.frustumCulled = false;
-      m.instanceMatrix.setUsage(DynamicDrawUsage);
-      m.count = 0;
+    for (let v = 0; v < this.variantCount; v++) {
+      const am = new InstancedMesh(this.geometries[v], this.material, this.activeCap);
+      const rm = new InstancedMesh(this.geometries[v], this.material, this.rubbleSlots);
+      for (const m of [am, rm]) {
+        m.castShadow = opts.castShadow;
+        m.receiveShadow = true;
+        m.frustumCulled = false;
+        m.instanceMatrix.setUsage(DynamicDrawUsage);
+        m.count = 0;
+      }
+      am.setColorAt(0, _c.set(0xffffff)); // prime instanceColor
+      rm.setColorAt(0, _c.set(0xffffff));
+      this.activeMeshes.push(am);
+      this.rubbleMeshes.push(rm);
+
+      const free: number[] = [];
+      for (let i = this.activeCap - 1; i >= 0; i--) free.push(i);
+      this.activeFree.push(free);
+      this.activeMaxSlot.push(-1);
+      this.rubbleCursor.push(0);
+      this.rubbleCount.push(0);
+
+      this.group.add(am, rm);
     }
-    // prime instanceColor attributes
-    this.activeMesh.setColorAt(0, _c.set(0xffffff));
-    this.rubbleMesh.setColorAt(0, _c.set(0xffffff));
-
-    for (let i = this.activeCap - 1; i >= 0; i--) this.activeFree.push(i);
-    this.group.add(this.activeMesh, this.rubbleMesh);
   }
 
   get count(): number {
     return this.active.length;
   }
   get rubble(): number {
-    return this.rubbleCount;
+    let n = 0;
+    for (const c of this.rubbleCount) n += c;
+    return n;
   }
 
-  // ---------- active pool ----------
-  private allocActive(): number {
-    const slot = this.activeFree.pop();
+  // ---------- active pool (per-variant slots) ----------
+  private allocActive(v: number): number {
+    const slot = this.activeFree[v].pop();
     if (slot === undefined) return -1;
-    if (slot > this.activeMaxSlot) {
-      this.activeMaxSlot = slot;
-      this.activeMesh.count = slot + 1;
+    if (slot > this.activeMaxSlot[v]) {
+      this.activeMaxSlot[v] = slot;
+      this.activeMeshes[v].count = slot + 1;
     }
     return slot;
   }
 
-  private freeActiveSlot(slot: number) {
-    this.activeFree.push(slot);
+  private freeActiveSlot(v: number, slot: number) {
+    this.activeFree[v].push(slot);
     _m4.makeScale(0, 0, 0);
-    this.activeMesh.setMatrixAt(slot, _m4);
+    this.activeMeshes[v].setMatrixAt(slot, _m4);
   }
 
-  // ---------- rubble ring buffer (persistent residue) ----------
+  // ---------- rubble ring buffers (persistent residue) ----------
   private bake(
+    v: number,
     px: number, py: number, pz: number,
     qx: number, qy: number, qz: number, qw: number,
     sx: number, sy: number, sz: number,
     color: Color,
   ) {
-    const slot = this.rubbleCursor;
+    const mesh = this.rubbleMeshes[v];
+    const slot = this.rubbleCursor[v];
     _p.set(px, py, pz);
     _q.set(qx, qy, qz, qw);
     _s.set(sx, sy, sz);
     _m4.compose(_p, _q, _s);
-    this.rubbleMesh.setMatrixAt(slot, _m4);
-    this.rubbleMesh.setColorAt(slot, color);
-    this.rubbleCursor = (this.rubbleCursor + 1) % this.rubbleCap;
-    this.rubbleCount = Math.min(this.rubbleCap, this.rubbleCount + 1);
-    this.rubbleMesh.count = this.rubbleCount;
-    this.rubbleMesh.instanceMatrix.needsUpdate = true;
-    if (this.rubbleMesh.instanceColor) this.rubbleMesh.instanceColor.needsUpdate = true;
+    mesh.setMatrixAt(slot, _m4);
+    mesh.setColorAt(slot, color);
+    this.rubbleCursor[v] = (slot + 1) % this.rubbleSlots;
+    this.rubbleCount[v] = Math.min(this.rubbleSlots, this.rubbleCount[v] + 1);
+    mesh.count = this.rubbleCount[v];
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
   }
 
   /** Bake an active chunk into static rubble and free its rigid body. */
@@ -150,13 +270,19 @@ export class DebrisSystem {
     const e = this.active[index];
     const t = e.body.translation();
     const r = e.body.rotation();
-    this.bake(t.x, t.y, t.z, r.x, r.y, r.z, r.w, e.size[0], e.size[1], e.size[2], e.baseColor);
+    this.bake(
+      e.variant,
+      t.x, t.y, t.z,
+      r.x, r.y, r.z, r.w,
+      e.size[0], e.size[1], e.size[2],
+      e.baseColor,
+    );
     try {
       this.world.removeRigidBody(e.body);
     } catch {
       /* noop */
     }
-    this.freeActiveSlot(e.slot);
+    this.freeActiveSlot(e.variant, e.slot);
     this.active.splice(index, 1);
   }
 
@@ -167,13 +293,14 @@ export class DebrisSystem {
     } catch {
       /* noop */
     }
-    this.freeActiveSlot(e.slot);
+    this.freeActiveSlot(e.variant, e.slot);
     this.active.splice(index, 1);
   }
 
   private ensureRoom() {
     // hard ceiling on ACTIVE physics bodies — freeze the oldest into rubble
     while (this.active.length >= this.activeCap) {
+      this._dirtyM[this.active[0].variant] = true;
       this.bakeActive(0);
     }
   }
@@ -188,7 +315,8 @@ export class DebrisSystem {
     ang: [number, number, number],
   ): boolean {
     this.ensureRoom();
-    const slot = this.allocActive();
+    const variant = (Math.random() * this.variantCount) | 0;
+    const slot = this.allocActive(variant);
     if (slot < 0) return false;
     const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(pos[0], pos[1], pos[2])
@@ -197,6 +325,7 @@ export class DebrisSystem {
       .setAngularDamping(0.3);
     const body = this.world.createRigidBody(bodyDesc);
     this.world.createCollider(
+      // collider is a cheap cuboid around the (irregular) visual shard
       RAPIER.ColliderDesc.cuboid(size[0] / 2, size[1] / 2, size[2] / 2)
         .setRestitution(0.08)
         .setFriction(0.6) // lower so chunks slide/topple into flat piles, not standing stacks
@@ -206,19 +335,23 @@ export class DebrisSystem {
     body.setLinvel({ x: lin[0], y: lin[1], z: lin[2] }, true);
     body.setAngvel({ x: ang[0], y: ang[1], z: ang[2] }, true);
 
+    const baseColor = new Color(color);
+    jitterColorInPlace(baseColor, 0.14);
     const e: Chunk = {
       body,
+      variant,
       slot,
       size,
-      baseColor: new Color(color),
+      baseColor,
       hotColor: new Color(hotColor),
       born: this.simTime,
       hotDur,
     };
     this.active.push(e);
     this.writeActive(e);
-    this.activeMesh.setColorAt(slot, hotDur > 0 ? e.hotColor : e.baseColor);
-    if (this.activeMesh.instanceColor) this.activeMesh.instanceColor.needsUpdate = true;
+    this.activeMeshes[variant].setColorAt(slot, hotDur > 0 ? e.hotColor : e.baseColor);
+    const ic = this.activeMeshes[variant].instanceColor;
+    if (ic) ic.needsUpdate = true;
     return true;
   }
 
@@ -229,13 +362,14 @@ export class DebrisSystem {
     _q.set(r.x, r.y, r.z, r.w);
     _s.set(e.size[0], e.size[1], e.size[2]);
     _m4.compose(_p, _q, _s);
-    this.activeMesh.setMatrixAt(e.slot, _m4);
+    this.activeMeshes[e.variant].setMatrixAt(e.slot, _m4);
   }
 
   /**
-   * Voxel-chunk a building into roughly-cubic physics pieces (item 1). desired
-   * ~= target piece count; a cubic cell size is derived so tall buildings get
-   * multiple vertical layers and pieces never become tall slivers.
+   * Voxel-chunk a building into roughly-cubic physics pieces (item 1). A cubic
+   * cell size is derived so tall buildings get multiple vertical layers and
+   * pieces never become tall slivers. Cells are split UNEVENLY and each chunk
+   * gets an irregular non-uniform scale so sizes span small shards to big lumps.
    */
   fractureBuilding(
     center: [number, number, number],
@@ -254,19 +388,36 @@ export class DebrisSystem {
     const nx = Math.max(1, Math.min(3, Math.round(w / s)));
     const ny = Math.max(1, Math.min(14, Math.round(h / s)));
     const nz = Math.max(1, Math.min(3, Math.round(d / s)));
-    const cw = w / nx, ch = h / ny, cd = d / nz;
+    const xs = splitAxis(w, nx);
+    const ys = splitAxis(h, ny);
+    const zs = splitAxis(d, nz);
     const baseX = center[0] - w / 2;
+    const baseY = center[1] - h / 2;
     const baseZ = center[2] - d / 2;
     let spawned = 0;
 
-    for (let ix = 0; ix < nx; ix++) {
-      for (let iy = 0; iy < ny; iy++) {
+    let oy = baseY;
+    for (let iy = 0; iy < ny; iy++) {
+      const ch = ys[iy];
+      const py = oy + ch / 2;
+      oy += ch;
+      let ox = baseX;
+      for (let ix = 0; ix < nx; ix++) {
+        const cw = xs[ix];
+        const px = ox + cw / 2;
+        ox += cw;
+        let oz = baseZ;
         for (let iz = 0; iz < nz; iz++) {
-          const px = baseX + (ix + 0.5) * cw;
-          const py = center[1] + (iy + 0.5) * ch;
-          const pz = baseZ + (iz + 0.5) * cd;
-          const jx = 0.82 + Math.random() * 0.16;
-          const cs: [number, number, number] = [cw * jx, ch * jx, cd * jx];
+          const cd = zs[iz];
+          const pz = oz + cd / 2;
+          oz += cd;
+
+          // per-chunk non-uniform shrink so pieces don't perfectly re-tile the box
+          const cs: [number, number, number] = [
+            cw * (0.7 + Math.random() * 0.28),
+            ch * (0.7 + Math.random() * 0.28),
+            cd * (0.7 + Math.random() * 0.28),
+          ];
 
           _dir.set(px - impact.x, py - impact.y, pz - impact.z);
           const dist = Math.max(0.7, _dir.length());
@@ -317,13 +468,21 @@ export class DebrisSystem {
       (Math.random() - 0.5) * 12,
       (Math.random() - 0.5) * 12,
     ];
-    return this.spawnChunk(pos, [s, s * 1.4, s], color, hotColor, 0, lin, ang);
+    // irregular, slightly tall clod
+    const size: [number, number, number] = [
+      s * (0.8 + Math.random() * 0.4),
+      s * (1.1 + Math.random() * 0.6),
+      s * (0.8 + Math.random() * 0.4),
+    ];
+    return this.spawnChunk(pos, size, color, hotColor, 0, lin, ang);
   }
 
   /**
-   * Collapse a building straight into a static rubble pile (no physics) — used
+   * Collapse a building straight into a static rubble PILE (no physics) — used
    * for the far overflow of a big blast so residue appears everywhere without
-   * spawning hundreds of bodies.
+   * spawning hundreds of bodies. Pieces are irregular shards of widely varying
+   * size, randomly rotated, tinted, and stacked denser at the bottom (a mound,
+   * not a repeated-cube grid).
    */
   collapseToRubble(
     center: [number, number, number],
@@ -331,61 +490,89 @@ export class DebrisSystem {
     color: number,
   ) {
     const [w, h, d] = size;
-    const n = 4 + (h > 26 ? 3 : 0);
+    const n = 6 + (h > 26 ? 4 : 2) + ((Math.random() * 3) | 0);
     const c = new Color(color);
+    const pileH = Math.min(h * 0.4, 6);
     for (let i = 0; i < n; i++) {
-      const sx = w * (0.28 + Math.random() * 0.3);
-      const sy = Math.min(h, Math.max(w, d)) * (0.22 + Math.random() * 0.28);
-      const sz = d * (0.28 + Math.random() * 0.3);
-      const px = center[0] + (Math.random() - 0.5) * w * 0.7;
-      const pz = center[2] + (Math.random() - 0.5) * d * 0.7;
-      const py = center[1] + sy / 2 + Math.random() * Math.min(h * 0.12, 2);
+      const variant = (Math.random() * this.variantCount) | 0;
+      // wide size range: small shards through big lumps
+      const sx = w * (0.2 + Math.random() * 0.5);
+      const sy = Math.min(h, Math.max(w, d)) * (0.16 + Math.random() * 0.42);
+      const sz = d * (0.2 + Math.random() * 0.5);
+      const px = center[0] + (Math.random() - 0.5) * w * 0.8;
+      const pz = center[2] + (Math.random() - 0.5) * d * 0.8;
+      const lo = Math.random();
+      const py = sy / 2 + lo * lo * pileH; // bias low -> mound
       _e.set(
-        (Math.random() - 0.5) * 0.6,
-        Math.random() * Math.PI,
-        (Math.random() - 0.5) * 0.6,
+        (Math.random() - 0.5) * 1.1,
+        Math.random() * Math.PI * 2,
+        (Math.random() - 0.5) * 1.1,
       );
-      _q.setFromEuler(_e);
-      this.bake(px, py, pz, _q.x, _q.y, _q.z, _q.w, sx, sy, sz, c);
+      _q2.setFromEuler(_e);
+      _c.copy(c);
+      jitterColorInPlace(_c, 0.16);
+      this.bake(variant, px, py, pz, _q2.x, _q2.y, _q2.z, _q2.w, sx, sy, sz, _c);
     }
   }
 
-  /** Bake a tiny rubble mound where a felled tree stood (residue). */
+  /** Bake a small irregular rubble mound where a felled tree stood (residue). */
   treeStump(x: number, z: number, scale: number, color: number) {
     const c = new Color(color);
-    this.bake(x, 0.4 * scale, z, 0, 0, 0, 1, 1.6 * scale, 0.7 * scale, 1.6 * scale, c);
+    const n = 2 + ((Math.random() * 2) | 0);
+    for (let i = 0; i < n; i++) {
+      const variant = (Math.random() * this.variantCount) | 0;
+      const px = x + (Math.random() - 0.5) * 1.7 * scale;
+      const pz = z + (Math.random() - 0.5) * 1.7 * scale;
+      const sx = (0.9 + Math.random() * 0.9) * scale;
+      const sy = (0.5 + Math.random() * 0.6) * scale;
+      const sz = (0.9 + Math.random() * 0.9) * scale;
+      const py = sy / 2 + Math.random() * 0.3 * scale;
+      _e.set(
+        (Math.random() - 0.5) * 0.9,
+        Math.random() * Math.PI * 2,
+        (Math.random() - 0.5) * 0.9,
+      );
+      _q2.setFromEuler(_e);
+      _c.copy(c);
+      jitterColorInPlace(_c, 0.16);
+      this.bake(variant, px, py, pz, _q2.x, _q2.y, _q2.z, _q2.w, sx, sy, sz, _c);
+    }
   }
 
   update(simTime: number) {
     this.simTime = simTime;
-    let anyMatrix = false;
-    let anyColor = false;
+    this._dirtyM.fill(false);
+    this._dirtyC.fill(false);
     for (let i = this.active.length - 1; i >= 0; i--) {
       const e = this.active[i];
+      const v = e.variant;
       const t = e.body.translation();
       if (t.y < CULL_Y) {
         this.cullActive(i);
-        anyMatrix = true;
+        this._dirtyM[v] = true;
         continue;
       }
       if (e.body.isSleeping()) {
         this.bakeActive(i); // settle -> persistent rubble, free the body
-        anyMatrix = true;
+        this._dirtyM[v] = true;
         continue;
       }
       this.writeActive(e);
-      anyMatrix = true;
+      this._dirtyM[v] = true;
       if (e.hotDur > 0) {
         const k = Math.max(0, 1 - (simTime - e.born) / e.hotDur);
         if (k <= 0) e.hotDur = 0;
         _c.copy(e.baseColor).lerp(e.hotColor, k);
-        this.activeMesh.setColorAt(e.slot, _c);
-        anyColor = true;
+        this.activeMeshes[v].setColorAt(e.slot, _c);
+        this._dirtyC[v] = true;
       }
     }
-    if (anyMatrix) this.activeMesh.instanceMatrix.needsUpdate = true;
-    if (anyColor && this.activeMesh.instanceColor) {
-      this.activeMesh.instanceColor.needsUpdate = true;
+    for (let v = 0; v < this.variantCount; v++) {
+      if (this._dirtyM[v]) this.activeMeshes[v].instanceMatrix.needsUpdate = true;
+      if (this._dirtyC[v]) {
+        const ic = this.activeMeshes[v].instanceColor;
+        if (ic) ic.needsUpdate = true;
+      }
     }
   }
 
@@ -398,18 +585,20 @@ export class DebrisSystem {
       }
     }
     this.active.length = 0;
-    this.activeFree.length = 0;
-    for (let i = this.activeCap - 1; i >= 0; i--) this.activeFree.push(i);
-    this.activeMaxSlot = -1;
-    this.activeMesh.count = 0;
-    this.rubbleCursor = 0;
-    this.rubbleCount = 0;
-    this.rubbleMesh.count = 0;
+    for (let v = 0; v < this.variantCount; v++) {
+      this.activeFree[v].length = 0;
+      for (let i = this.activeCap - 1; i >= 0; i--) this.activeFree[v].push(i);
+      this.activeMaxSlot[v] = -1;
+      this.activeMeshes[v].count = 0;
+      this.rubbleCursor[v] = 0;
+      this.rubbleCount[v] = 0;
+      this.rubbleMeshes[v].count = 0;
+    }
   }
 
   dispose() {
     this.reset();
-    this.activeMesh.geometry.dispose();
+    for (const g of this.geometries) g.dispose();
     this.material.dispose();
     this.group.clear();
   }
