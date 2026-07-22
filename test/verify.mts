@@ -12,7 +12,6 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import { generateCity } from '../lib/city/generateCity';
 import { parseSeed, readShareState, isMeteorType, isMeteorSize } from '../lib/share';
 import { makeWorld } from '../lib/physics/world';
-import { buildFractureCache } from '../lib/physics/fracture';
 import { DebrisSystem } from '../lib/physics/debrisPool';
 import { Vector3 } from 'three';
 
@@ -60,26 +59,32 @@ function parsing() {
 async function cap() {
   await RAPIER.init();
   const world = makeWorld();
-  const templates = buildFractureCache([12, 20]);
-  const CAP = 50;
-  const debris = new DebrisSystem(world, { cap: CAP, templates, castShadow: false });
+  const ACTIVE = 50;
+  const RUBBLE = 400;
+  const debris = new DebrisSystem(world, {
+    activeCap: ACTIVE,
+    rubbleCap: RUBBLE,
+    castShadow: false,
+  });
   const impact = new Vector3(0, 0, 0);
-  let maxSeen = 0;
-  // sustained spawning: far more fragments than the cap, over many "impacts"
-  for (let i = 0; i < 40; i++) {
-    debris.fractureBuilding([i * 6, 0, 0], [8, 20, 8], 0x888888, impact, 1.0, 0xc24a20, 0.3, 20);
-    debris.toppleBuilding([i * 6 + 3, 0, 3], [8, 20, 8], 0x888888, impact);
+  let maxActive = 0;
+  // sustained voxel-chunking: far more chunks than the active cap. Over-cap
+  // chunks are force-baked into static rubble (residue), so active bodies stay
+  // bounded while rubble accumulates.
+  for (let i = 0; i < 30; i++) {
+    debris.fractureBuilding([i * 10, 0, 0], [8, 40, 8], 0x888888, impact, 1.0, 0xc24a20, 0.3, 20);
     world.step();
     debris.update(i * 0.05);
-    maxSeen = Math.max(maxSeen, debris.count);
-    if (debris.count > CAP) break;
+    maxActive = Math.max(maxActive, debris.count);
   }
-  ok('debris never exceeds cap', debris.count <= CAP && maxSeen <= CAP, `max=${maxSeen} cap=${CAP}`);
-  ok('debris pool actually fills', maxSeen >= CAP * 0.6, `max=${maxSeen}`);
+  ok('active debris never exceeds activeCap', debris.count <= ACTIVE && maxActive <= ACTIVE, `max=${maxActive} cap=${ACTIVE}`);
+  ok('active pool actually fills', maxActive >= ACTIVE * 0.6, `max=${maxActive}`);
+  ok('rubble accumulates (persistent residue)', debris.rubble > 0, `rubble=${debris.rubble}`);
+  ok('rubble bounded by rubbleCap', debris.rubble <= RUBBLE, `rubble=${debris.rubble}`);
 
-  // after reset, everything is gone
   debris.reset();
-  ok('reset clears debris', debris.count === 0);
+  ok('reset clears active', debris.count === 0);
+  ok('reset clears rubble', debris.rubble === 0);
 }
 
 (async () => {

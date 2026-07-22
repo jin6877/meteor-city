@@ -1,8 +1,9 @@
 /* eslint-disable */
-// Capture default + max-zoom + post-impact screenshots and confirm agents move.
+// Reality-pass verification: blue windows, chunky rubble (no slivers), rubble
+// stays, meteor embedded, building-top burst at contact height, trees felled.
 const puppeteer = require('puppeteer-core');
 const path = require('path');
-const PORT = process.env.SMOKE_PORT || '3151';
+const PORT = process.env.SMOKE_PORT || '3153';
 const OUT = 'C:/Users/jin68/AppData/Local/Temp/claude/c--dev-project-side-app/ca750ade-268c-4251-82ca-f03bab9bbc54/scratchpad';
 const CHROME = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -13,36 +14,45 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await p.setViewport({ width: 1360, height: 860, deviceScaleFactor: 1 });
   const errs = [];
   p.on('pageerror', e => errs.push(String(e)));
-  await p.goto(`http://localhost:${PORT}/?seed=12345&type=rocky&size=M`, { waitUntil: 'domcontentloaded' });
+  await p.goto(`http://localhost:${PORT}/?seed=12345&type=rocky&size=L`, { waitUntil: 'domcontentloaded' });
   await p.waitForFunction('window.__meteor && window.__meteor.ready && window.__meteor.ready()', { timeout: 60000, polling: 400 });
   await sleep(1500);
-  await p.screenshot({ path: path.join(OUT, 'mc2-default.png') });
+  await p.screenshot({ path: path.join(OUT, 'mc3-default.png') });
+  const before = await p.evaluate(() => window.__meteor.stats());
+  console.log('before:', JSON.stringify(before));
 
-  // agents move?
-  const a0 = await p.evaluate(() => window.__meteor.agentPos());
-  await sleep(1600);
-  const a1 = await p.evaluate(() => window.__meteor.agentPos());
-  const moved = a0 && a1 && (Math.abs(a0[0]-a1[0]) + Math.abs(a0[1]-a1[1])) > 0.5;
-  console.log('agent car pos', JSON.stringify(a0), '->', JSON.stringify(a1), 'MOVED=' + moved);
+  // drop several onto downtown (near origin => tall towers); record the highest
+  // contact point to prove building-top bursts fire up high (item 5).
+  let maxImpactY = 0;
+  const spots = [[0,0],[12,-8],[-10,10],[8,14],[-14,-6]];
+  for (const [x,z] of spots) {
+    await p.evaluate((x,z)=>window.__meteor.drop(x,z), x, z);
+    await sleep(400);
+  }
+  let st;
+  for (let i=0;i<50;i++){
+    await sleep(600);
+    st = await p.evaluate(()=>window.__meteor.stats());
+    const li = await p.evaluate(()=>window.__meteor.lastImpact());
+    if (li) maxImpactY = Math.max(maxImpactY, li[1]);
+    if (st.rubble > 40 && st.debris < st.rubble) break;
+  }
+  console.log('after impacts:', JSON.stringify(st));
+  console.log('max contact height (item5):', maxImpactY.toFixed(1));
 
-  // zoom OUT to max (few big wheel steps)
+  // let everything settle so any slivers would be obvious and rubble bakes
+  // (SwiftShader sim is slow, so wait generously)
+  await sleep(9000);
+  const settled = await p.evaluate(()=>window.__meteor.stats());
+  console.log('settled:', JSON.stringify(settled));
+
+  // zoom in toward the crater for chunky-rubble / embedded-meteor detail
   const canvas = await p.$('canvas');
   const box = await canvas.boundingBox();
   await p.mouse.move(box.x + box.width/2, box.y + box.height/2);
-  for (let i = 0; i < 16; i++) { await p.mouse.wheel({ deltaY: 500 }); await sleep(60); }
-  await sleep(1600);
-  await p.screenshot({ path: path.join(OUT, 'mc2-zoomout.png') });
-
-  // zoom back in, drop a big comet, wait for fracture, screenshot
-  for (let i = 0; i < 20; i++) { await p.mouse.wheel({ deltaY: -500 }); await sleep(50); }
-  await p.goto(`http://localhost:${PORT}/?seed=12345&type=comet&size=L`, { waitUntil: 'domcontentloaded' });
-  await p.waitForFunction('window.__meteor && window.__meteor.ready && window.__meteor.ready()', { timeout: 60000, polling: 400 });
-  await sleep(1000);
-  for (const [x,z] of [[0,0],[-20,15],[25,-10]]) { await p.evaluate((x,z)=>window.__meteor.drop(x,z), x, z); await sleep(400); }
-  let st;
-  for (let i=0;i<40;i++){ await sleep(600); st = await p.evaluate(()=>window.__meteor.stats()); if (st.debris>20) break; }
-  console.log('impact stats', JSON.stringify(st));
-  await p.screenshot({ path: path.join(OUT, 'mc2-impact.png') });
+  for (let i=0;i<10;i++){ await p.mouse.wheel({ deltaY: -420 }); await sleep(50); }
+  await sleep(1200);
+  await p.screenshot({ path: path.join(OUT, 'mc3-after.png') });
 
   console.log('pageErrors:', errs.length, errs.slice(0,3).join(' | '));
   await b.close();
