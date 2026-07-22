@@ -12,6 +12,8 @@
 
 # testing
 /coverage
+# transient esbuild bundle for the headless verify harness (test/verify.mts)
+/.verify.cjs
 
 # next.js
 /.next/
