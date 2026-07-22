@@ -82,13 +82,16 @@ function SceneSetup({ radius }: { radius: number }) {
   const scene = useThree((s) => s.scene);
   useEffect(() => {
     scene.environmentIntensity = ENV_INTENSITY;
+    // solid fallback so zoomed-out corners never read as black behind the sky
+    scene.background = new Color(SKY_HORIZON);
   }, [scene]);
 
   const sun = new Vector3(...SUN_DIR).normalize().multiplyScalar(radius * 2.2);
-  const shadowExtent = radius * 1.15;
+  const shadowExtent = radius * 1.12;
   return (
     <>
-      <fog attach="fog" args={[FOG_COLOR, radius * 1.3, radius * 3.2]} />
+      {/* fog only melts the far diorama edge — keep the city body clear (DESIGN §3) */}
+      <fog attach="fog" args={[FOG_COLOR, radius * 2.1, radius * 4.4]} />
       <hemisphereLight args={[HEMI_SKY, HEMI_GROUND, HEMI_INTENSITY]} />
       <directionalLight
         position={[sun.x, sun.y, sun.z]}
@@ -269,10 +272,10 @@ export default function Scene({
         powerPreference: 'high-performance',
       }}
       camera={{
-        position: [radius * 1.15, radius * 0.95, radius * 1.15],
-        fov: 30,
+        position: [radius * 0.98, radius * 0.82, radius * 0.98],
+        fov: 32,
         near: 1,
-        far: radius * 8,
+        far: radius * 9,
       }}
       style={{ position: 'fixed', inset: 0, width: '100vw', height: '100vh' }}
     >
@@ -296,15 +299,15 @@ export default function Scene({
         makeDefault
         enableDamping
         dampingFactor={0.08}
-        minDistance={radius * 0.4}
-        maxDistance={radius * 2.6}
-        maxPolarAngle={1.3}
-        minPolarAngle={0.15}
+        minDistance={radius * 0.5}
+        maxDistance={radius * 1.9}
+        maxPolarAngle={1.32}
+        minPolarAngle={0.18}
         target={[0, 4, 0]}
       />
 
       <EngineRunner engine={engine} />
-      <PostFX engine={engine} quality={quality} />
+      <PostFX engine={engine} quality={quality} radius={radius} />
     </Canvas>
   );
 }

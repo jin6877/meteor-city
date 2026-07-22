@@ -29,7 +29,7 @@ export const SUN_INTENSITY = 3.0;
 export const HEMI_SKY = 0xcfe0ea;
 export const HEMI_GROUND = 0xb8ae9e;
 export const HEMI_INTENSITY = 0.55;
-export const ENV_INTENSITY = 0.7;
+export const ENV_INTENSITY = 0.6;
 export const TONE_EXPOSURE = 1.05;
 
 // ---- Roads / ground surfaces (DESIGN §2) ----
