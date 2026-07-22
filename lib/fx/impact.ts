@@ -146,7 +146,8 @@ class RingPool {
   fire(pos: [number, number, number], maxR: number, color: number) {
     const it = this.items.find((i) => !i.mesh.visible) ?? this.items[0];
     it.mesh.visible = true;
-    it.mesh.position.set(pos[0], 0.14, pos[2]);
+    // ring hugs the contact height (building-top hits ring up high, ground hits low)
+    it.mesh.position.set(pos[0], Math.max(0.14, pos[1]), pos[2]);
     (it.mesh.material as MeshBasicMaterial).color.set(color);
     it.life = 0;
     it.dur = 0.55;
@@ -333,7 +334,8 @@ export class FXManager {
     this.decals = new DecalPool(this.group, 28);
   }
 
-  triggerImpact(
+  /** Flash + shockwave ring + dust + bloom spike AT the contact point (any height). */
+  burst(
     point: [number, number, number],
     preset: MeteorPreset,
     R1: number,
@@ -350,14 +352,19 @@ export class FXManager {
       this.flashes.fire(point, preset.flashColor, flashScale, preset.flashIntensity);
       this.rings.fire(point, R2, 0xf5ead8);
       this.dust.fire(point, preset.dustColor, preset.dustAmount, preset.dustCool);
-      this.decals.place(
-        point,
-        R1 * 1.5 * preset.craterScale,
-        preset.craterDark,
-        0x6e6152,
-      );
     }
     this.bloomEnergy = Math.max(this.bloomEnergy, preset.bloomSpike);
+  }
+
+  /** Persistent crater + scorch decal on the GROUND (where the meteor embeds). */
+  crater(point: [number, number, number], preset: MeteorPreset, overWater: boolean) {
+    if (overWater) return; // water gets ripples, not a crater
+    this.decals.place(
+      point,
+      preset.R1 * 1.5 * preset.craterScale,
+      preset.craterDark,
+      0x6e6152,
+    );
   }
 
   update(dt: number) {

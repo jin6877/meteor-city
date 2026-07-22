@@ -8,7 +8,6 @@
 import { Group, Vector3, type Camera, type Object3D } from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { initRapier, makeWorld, addCityColliders, FixedStepper, type StaticColliders } from './physics/world';
-import { buildFractureCache } from './physics/fracture';
 import { DebrisSystem } from './physics/debrisPool';
 import { spawnMeteorBody, buildMeteorMesh, type MeteorBody } from './physics/meteor';
 import { FXManager } from './fx/impact';
@@ -33,7 +32,17 @@ interface MeteorEntry {
   impacted: boolean;
   born: number;
   velDir: Vector3;
+  radius: number;
 }
+
+interface EmbeddedMeteor {
+  group: Group;
+  mat: { emissiveIntensity: number } | null;
+  start: number; // initial emissive intensity (for cool-down)
+  born: number;
+}
+
+const MAX_EMBEDDED = 10;
 
 const BASE_BLOOM = 0.25; // Bloom now runs on tone-mapped color; keep the city calm, spike only on impact
 const MAX_CONCURRENT_METEORS = 6;
@@ -69,12 +78,14 @@ export class Engine {
   private agents: AgentSystem | null = null;
 
   private meteors: MeteorEntry[] = [];
+  private embedded: EmbeddedMeteor[] = [];
   private simTime = 0;
   private timeScale = 1;
   private _off = new Vector3();
   private _tmp = new Vector3();
 
   ready = false;
+  lastImpactPoint: [number, number, number] | null = null; // for verification (contact height)
   onImpact: ((point: Vector3, resolved: ResolvedMeteor) => void) | null = null;
 
   constructor(quality: QualityPreset) {
@@ -87,10 +98,9 @@ export class Engine {
     await initRapier();
     this.world = makeWorld();
     this.eventQueue = new RAPIER.EventQueue(true);
-    const templates = buildFractureCache(this.quality.fractureCounts);
     this.debris = new DebrisSystem(this.world, {
-      cap: this.quality.debrisCap,
-      templates,
+      activeCap: this.quality.activeCap,
+      rubbleCap: this.quality.rubbleCap,
       castShadow: this.quality.debrisShadows,
     });
     this.root.add(this.debris.group);
@@ -169,12 +179,18 @@ export class Engine {
       impacted: false,
       born: this.simTime,
       velDir,
+      radius: resolved.radius,
     });
   }
 
   private clearMeteors() {
     for (const mt of this.meteors) this.destroyMeteor(mt);
     this.meteors.length = 0;
+    for (const em of this.embedded) {
+      this.root.remove(em.group);
+      disposeObject(em.group);
+    }
+    this.embedded.length = 0;
   }
   private destroyMeteor(mt: MeteorEntry) {
     this.root.remove(mt.group);
@@ -202,8 +218,18 @@ export class Engine {
     this.stepper.step(delta, this.timeScale, (dt) => this.fixedStep(dt));
     this.syncMeteorMeshes(delta);
     this.agents?.update(delta * this.timeScale); // slow-mo affects traffic too
+    this.coolEmbedded();
     this.shake.apply(camera, delta, this._off);
     this.bloom.value = Math.max(BASE_BLOOM, this.fx.bloomEnergy);
+  }
+
+  private coolEmbedded() {
+    for (const em of this.embedded) {
+      if (!em.mat) continue;
+      const age = this.simTime - em.born;
+      const k = Math.max(0.12, 1 - age / 3.5); // cools to embers, keeps a faint glow
+      em.mat.emissiveIntensity = em.start * k;
+    }
   }
 
   private fixedStep(dt: number) {
@@ -238,28 +264,71 @@ export class Engine {
 
   private resolveImpact(mt: MeteorEntry) {
     const t = mt.body.translation();
-    const impact = new Vector3(t.x, Math.max(0.3, t.y), t.z);
+    const contactY = Math.max(0.3, t.y);
+    const preset = mt.resolved.preset;
+    const impact = new Vector3(t.x, contactY, t.z);
+    this.lastImpactPoint = [t.x, contactY, t.z];
+
+    // burst (flash/ring/dust/bloom) AT the contact height — a building-top hit
+    // explodes up high, a ground hit explodes low (item 5).
+    this.fx.burst([t.x, contactY, t.z], preset, mt.resolved.R1, mt.resolved.R2, mt.overWater);
+    // buildings + trees within the blast radius break apart / collapse
     this.applyDestruction(impact, mt.resolved);
-    this.fx.triggerImpact(
-      [impact.x, impact.y, impact.z],
-      mt.resolved.preset,
-      mt.resolved.R1,
-      mt.resolved.R2,
-      mt.overWater,
-    );
-    const trauma = Math.min(0.9, 0.4 * mt.resolved.preset.shakeScale * (mt.resolved.R2 / 30));
-    this.shake.add(trauma);
-    this.destroyMeteor(mt);
+    this.shake.add(Math.min(0.9, 0.4 * preset.shakeScale * (mt.resolved.R2 / 30)));
+
+    // meteor punches down and embeds in a ground crater directly below (item 2)
+    if (mt.overWater) {
+      this.destroyMeteor(mt); // splash, nothing to embed
+    } else {
+      this.fx.crater([t.x, 0.1, t.z], preset, mt.overWater);
+      this.embedMeteor(mt, t.x, t.z);
+    }
     this.onImpact?.(impact, mt.resolved);
+  }
+
+  /** Free the meteor's body; leave the mesh half-buried in the crater, cooling. */
+  private embedMeteor(mt: MeteorEntry, x: number, z: number) {
+    if (this.world) {
+      try {
+        this.world.removeRigidBody(mt.body);
+      } catch {
+        /* noop */
+      }
+    }
+    const g = mt.group;
+    g.position.set(x, -mt.radius * 0.42, z); // ~40% below the ground plane
+    g.rotation.set(
+      (Math.random() - 0.5) * 0.5,
+      Math.random() * Math.PI,
+      (Math.random() - 0.5) * 0.5,
+    );
+    const tail = g.userData.tail as { visible: boolean } | undefined;
+    if (tail) tail.visible = false;
+    const mat = (g.userData.meshMat as { emissiveIntensity: number } | undefined) ?? null;
+    this.embedded.push({
+      group: g,
+      mat,
+      start: mat ? mat.emissiveIntensity : 0,
+      born: this.simTime,
+    });
+    while (this.embedded.length > MAX_EMBEDDED) {
+      const old = this.embedded.shift()!;
+      this.root.remove(old.group);
+      disposeObject(old.group);
+    }
   }
 
   private applyDestruction(impact: Vector3, resolved: ResolvedMeteor) {
     if (!this.city || !this.statics || !this.debris || !this.world) return;
     const { R1, R2 } = resolved;
-    // Everything within the blast radius R2 gets FRACTURED (not just toppled) —
-    // sorted nearest-first, up to the per-impact cap. Only the overflow (far
-    // edge of a huge blast) falls back to a cheap single-box topple, so "hit but
-    // not broken / passes through" no longer happens.
+    const preset = resolved.preset;
+    const jitter = preset.id === 'jagged' ? 0.8 : 0.25;
+    const coarse = this.quality.chunksCoarse;
+    const fine = this.quality.chunksFine;
+
+    // Buildings within R2 collapse. Nearest ones (up to the per-impact cap) get
+    // voxel-chunked into physics rubble; the far overflow collapses straight to
+    // static rubble piles. Nothing survives standing.
     const hit: { id: number; d: number }[] = [];
     for (const info of this.city.infos.values()) {
       if (!info.alive) continue;
@@ -271,21 +340,15 @@ export class Engine {
     hit.sort((a, b) => a.d - b.d);
 
     const maxF = this.quality.maxFractureBuildings;
-    const preset = resolved.preset;
-    const jitter = preset.id === 'jagged' ? 0.8 : 0.25;
-    const coarse = this.quality.fragmentsCoarse;
-    const fine = this.quality.fragmentsFine;
-
     for (let i = 0; i < hit.length; i++) {
       const c = hit[i];
       const info = this.city.infos.get(c.id)!;
       this.city.destroyBuilding(info.id);
       this.statics.removeBuilding(this.world, info.id);
       if (i < maxF) {
-        // near/tall buildings shatter into more pieces (size + zone proportional)
+        // near / tall buildings shatter into more chunks (size + zone proportional)
         const tall = info.size[1] > 22;
-        const near = c.d < R1;
-        const desired = near || tall ? fine : coarse;
+        const desired = c.d < R1 || tall ? fine : coarse;
         this.debris.fractureBuilding(
           info.center,
           info.size,
@@ -297,9 +360,23 @@ export class Engine {
           desired,
         );
       } else {
-        this.debris.toppleBuilding(info.center, info.size, info.color, impact);
+        this.debris.collapseToRubble(info.center, info.size, info.color);
       }
     }
+
+    // trees within the blast are felled — near ones fly, the rest leave a stump
+    const removed = this.city.removeTreesInRadius(impact.x, impact.z, R2 * 0.95);
+    let flew = 0;
+    for (const tr of removed) {
+      const d = Math.hypot(tr.x - impact.x, tr.z - impact.z);
+      if (d < R1 * 1.2 && flew < 10) {
+        this.debris.spawnFlyingChunk([tr.x, 2 * tr.scale, tr.z], 1.3 * tr.scale, tr.leafColor, impact);
+        flew++;
+      } else {
+        this.debris.treeStump(tr.x, tr.z, tr.scale, tr.leafColor);
+      }
+    }
+
     this.agents?.reactToImpact(impact, R2 * 1.15);
   }
 
@@ -334,6 +411,8 @@ export class Engine {
       ready: this.ready,
       buildingsAlive: alive,
       debris: this.debris?.count ?? 0,
+      rubble: this.debris?.rubble ?? 0,
+      embedded: this.embedded.length,
       meteors: this.meteors.length,
       slomo: this.slomo,
     };

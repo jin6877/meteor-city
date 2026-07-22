@@ -174,6 +174,7 @@ export default function App() {
       ready: () => (engineRef.current?.getStats().buildingsAlive ?? 0) > 0,
       stats: () => engineRef.current?.getStats(),
       agentPos: () => engineRef.current?.agentSample() ?? null,
+      lastImpact: () => engineRef.current?.lastImpactPoint ?? null,
       seed: () => seedRef.current,
       drop: (x: number, z: number) => {
         const s = settingsRef.current;
