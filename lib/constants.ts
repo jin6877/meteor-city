@@ -117,23 +117,87 @@ export const WINDOW_TINT = 0xaecadf; // soft sky-blue
 export const WINDOW_TINT_COOL = 0x9fbcd6; // slightly deeper for concrete
 export const WINDOW_EMISSIVE = { glass: 0.5, concrete: 0.28 } as const;
 
-// ---- Rising smoke (impact residue — separate budget from debris/rubble) ----
-// A dark warm-gray column that rises off the crater and slowly disperses. Kept
-// restrained (low alpha, expands + fades) for the diorama tone — NOT photoreal
-// thick smoke (DESIGN §7 Don't). All knobs live here for easy tuning.
+// ---- Rising smoke (disaster pass — separate budget from debris/rubble) ----
+// A dark, heavy warm-black column that rises off craters AND keeps pouring off
+// active fires, expanding into a lingering plume so repeated hits turn the city
+// into a smoke-choked disaster (DESIGN §9 disaster-drama override of §7). It is
+// alpha-blended (never additive) and stays translucent — density comes from many
+// overlapping particles + long life, not from opacity. All knobs live here.
+// This backs a continuous ParticleField (ring buffer), not one-shot bursts.
 export const SMOKE = {
-  color: 0x4c4842, // dark warm gray (diorama smoke, never pure black)
-  colorCool: 0x8b9496, // comet / over-water: paler cool wisp
-  rise: 3.2, // base upward speed (world units/s)
-  riseJitter: 1.8, // per-particle rise variance (elongates the plume)
-  seedColumn: 3.6, // initial vertical seed spread (starts as a short column)
-  spread: 1.4, // initial horizontal seed radius (tight = column)
-  drift: 1.0, // lateral drift speed as it disperses
-  life: 5.5, // seconds — lingers well past the fast dust
-  hold: 0.5, // fraction of life held near peak before the slow fade
-  peakAlpha: 0.46, // restrained but readable (miniature tone, still translucent)
-  sizeStart: 6, // billboard size at birth
-  sizeEnd: 16, // billboard size at death (puff expands as it dissipates)
+  color: 0x2b2824, // heavy warm-black smoke (disaster tone; still not pure black)
+  colorEnd: 0x6f6a63, // lightens slightly as it thins and catches sky
+  colorCool: 0x9aa2a4, // comet / over-water: pale cool steam
+  count: { high: 560, low: 240 }, // particle pool (per tier)
+  rise: 3.4, // base upward speed (world units/s)
+  riseJitter: 2.0, // per-particle rise variance (elongates the plume)
+  seedColumn: 4.0, // initial vertical seed spread (starts as a short column)
+  spread: 1.6, // initial horizontal seed radius (tight = column)
+  drift: 0.55, // lateral expansion rate as it disperses
+  buoyancyDamp: 0.09, // buoyancy slowly bleeds off so the column tops out
+  life: 8.5, // seconds — long-lived, lingers into an ambient pall
+  lifeJitter: 2.5,
+  hold: 0.42, // fraction of life held near peak before the slow fade
+  peakAlpha: 0.5, // thicker than the old restrained wisp, still translucent
+  sizeStart: 8, // billboard size at birth
+  sizeEnd: 24, // billboard size at death (billows large as it dissipates)
+} as const;
+
+// ---- Fire + embers (disaster pass) — additive flame billboards + rising sparks ----
+// A fire "site" is ignited at each impact crater and at a few of the buildings it
+// levels; the site burns for a while (with re-ignition flare pulses), continuously
+// spitting short-lived flame tongues + embers + feeding the smoke column, then
+// fades. Bigger blasts light bigger, longer fires. Its OWN pooled budget (flame /
+// ember particle caps + a site cap), separate from debris — oldest is recycled.
+export const FIRE = {
+  // flame color gradient (hot core -> deep cooling red as a tongue rises)
+  hot: 0xffe8b0, // near-white hot base
+  mid: 0xff7a1e, // orange body
+  deep: 0x7c2408, // deep red as it cools/rises
+  sites: { high: 12, low: 6 }, // max simultaneous fire sites
+  flameCount: { high: 560, low: 240 }, // flame particle pool
+  emberColor: 0xffb060, // warm spark
+  emberCount: { high: 260, low: 110 }, // ember particle pool
+  life: 8.5, // base seconds a site burns
+  lifeJitter: 3.5, // + up to this (bigger blasts also extend below)
+  reignite: 1.5, // period (s) of flare pulses so fire "breathes" / re-ignites
+  radiusScale: 0.42, // fire footprint radius = R1 * this (clamped)
+  radiusMin: 3,
+  radiusMax: 16,
+  flameRate: 34, // flame particles/s per site at full strength
+  flameLife: 0.8, // per-tongue lifetime (short -> flickers)
+  flameRise: 9.5, // upward speed of flame tongues (taller, licking flames)
+  flameSizeStart: 11, // tongues start fat and bright...
+  flameSizeEnd: 3, // ...taper as they cool and rise
+  emberRate: 9, // embers/s per site
+  emberLife: 2.2,
+  emberRise: 11.5,
+  emberGravity: 3.0, // embers arc back down slightly
+  emberSize: 1.8,
+  smokeRate: 4.2, // smoke particles/s per site (persistent column feed)
+} as const;
+
+// ---- Progressive collapse (top-to-bottom pancaking, heavy no-bounce debris) ----
+// Replaces the old "shatter everything outward at once" splay. A struck building
+// is voxel-chunked, then its layers LOSE SUPPORT in sequence — the impact layer
+// and everything above drop first, then each lower layer releases a beat later so
+// the mass pancakes down onto its own footprint instead of splaying across town.
+// Chunks are heavy (near-zero restitution, high friction, damped) so they thud
+// down and settle fast — no toy bouncing. All knobs here for easy tuning.
+export const COLLAPSE = {
+  layerDelay: 0.08, // s between successive lower layers losing support (pancake)
+  upStagger: 0.02, // s between upper (already-unsupported) layers
+  releaseBase: 0.06, // brief pause before collapse propagates below impact
+  scatter: 1.2, // weak lateral scatter (world u/s) — tiny vs the old outward splay
+  scatterImpact: 3.2, // extra lateral ONLY at the struck layer (meteor punch-through)
+  down: 1.6, // small downward kick on release (gravity does the rest)
+  ejecta: 3.4, // small upward ejecta ONLY at the struck layer, for drama
+  spin: 3.0, // angular velocity magnitude (calmer than the old ±9)
+  restitution: 0.045, // near-zero bounce (concrete lumps)
+  friction: 0.95, // high friction -> settles into a footprint pile, no sliding away
+  linDamp: 0.28, // heavy: drops without floaty bounce
+  angDamp: 0.62,
+  density: 2.0,
 } as const;
 
 // ---- Physics ----

@@ -41,6 +41,7 @@ import {
   Vector3,
 } from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
+import { COLLAPSE } from '../constants';
 
 type RWorld = InstanceType<typeof RAPIER.World>;
 type RBody = InstanceType<typeof RAPIER.RigidBody>;
@@ -54,6 +55,14 @@ interface Chunk {
   hotColor: Color;
   born: number;
   hotDur: number;
+  // ---- progressive collapse ----
+  // A "held" chunk is a lower building layer that has not yet lost support: it is
+  // a dynamic body pinned in place (gravityScale 0 + locked) so falling upper
+  // chunks rest on it. At `releaseAt` (sim time) it unlocks + drops onto the pile.
+  held: boolean;
+  releaseAt: number;
+  rlin: [number, number, number]; // velocity to apply on release
+  rang: [number, number, number];
 }
 
 const _m4 = new Matrix4();
@@ -172,6 +181,7 @@ export class DebrisSystem {
   private _dirtyM: boolean[];
   private _dirtyC: boolean[];
   private simTime = 0;
+  private heldCount = 0; // chunks currently pinned mid-collapse (progressive collapse)
 
   constructor(world: RWorld, opts: DebrisOptions) {
     this.world = world;
@@ -268,6 +278,7 @@ export class DebrisSystem {
   /** Bake an active chunk into static rubble and free its rigid body. */
   private bakeActive(index: number) {
     const e = this.active[index];
+    if (e.held) this.heldCount--;
     const t = e.body.translation();
     const r = e.body.rotation();
     this.bake(
@@ -288,6 +299,7 @@ export class DebrisSystem {
 
   private cullActive(index: number) {
     const e = this.active[index];
+    if (e.held) this.heldCount--;
     try {
       this.world.removeRigidBody(e.body);
     } catch {
@@ -298,10 +310,14 @@ export class DebrisSystem {
   }
 
   private ensureRoom() {
-    // hard ceiling on ACTIVE physics bodies — freeze the oldest into rubble
+    // hard ceiling on ACTIVE physics bodies — freeze the oldest into rubble.
+    // Prefer an already-fallen (non-held) chunk so a still-standing lower layer
+    // mid-collapse isn't frozen in mid-air; fall back to oldest if all are held.
     while (this.active.length >= this.activeCap) {
-      this._dirtyM[this.active[0].variant] = true;
-      this.bakeActive(0);
+      let idx = this.active.findIndex((c) => !c.held);
+      if (idx < 0) idx = 0;
+      this._dirtyM[this.active[idx].variant] = true;
+      this.bakeActive(idx);
     }
   }
 
@@ -313,27 +329,39 @@ export class DebrisSystem {
     hotDur: number,
     lin: [number, number, number],
     ang: [number, number, number],
+    hold = false, // pin in place until releaseAt (progressive collapse)
+    releaseAt = 0,
   ): boolean {
     this.ensureRoom();
     const variant = (Math.random() * this.variantCount) | 0;
     const slot = this.allocActive(variant);
     if (slot < 0) return false;
+    // Every chunk is a DYNAMIC body (so mass is correct from the start). A "held"
+    // lower layer is pinned with gravityScale 0 + locked translation/rotation so
+    // it stands firm and upper chunks pile on it; it releases (unlock + gravity)
+    // at releaseAt. Heavy, near-zero-restitution, damped -> thuds down, no bounce.
     const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(pos[0], pos[1], pos[2])
       .setCanSleep(true)
-      .setLinearDamping(0.05)
-      .setAngularDamping(0.3);
+      .setGravityScale(hold ? 0 : 1)
+      .setLinearDamping(COLLAPSE.linDamp)
+      .setAngularDamping(COLLAPSE.angDamp);
     const body = this.world.createRigidBody(bodyDesc);
     this.world.createCollider(
       // collider is a cheap cuboid around the (irregular) visual shard
       RAPIER.ColliderDesc.cuboid(size[0] / 2, size[1] / 2, size[2] / 2)
-        .setRestitution(0.08)
-        .setFriction(0.6) // lower so chunks slide/topple into flat piles, not standing stacks
-        .setDensity(1.6),
+        .setRestitution(COLLAPSE.restitution)
+        .setFriction(COLLAPSE.friction)
+        .setDensity(COLLAPSE.density),
       body,
     );
-    body.setLinvel({ x: lin[0], y: lin[1], z: lin[2] }, true);
-    body.setAngvel({ x: ang[0], y: ang[1], z: ang[2] }, true);
+    if (hold) {
+      body.lockTranslations(true, false);
+      body.lockRotations(true, false);
+    } else {
+      body.setLinvel({ x: lin[0], y: lin[1], z: lin[2] }, true);
+      body.setAngvel({ x: ang[0], y: ang[1], z: ang[2] }, true);
+    }
 
     const baseColor = new Color(color);
     jitterColorInPlace(baseColor, 0.14);
@@ -346,13 +374,32 @@ export class DebrisSystem {
       hotColor: new Color(hotColor),
       born: this.simTime,
       hotDur,
+      held: hold,
+      releaseAt,
+      rlin: lin,
+      rang: ang,
     };
     this.active.push(e);
+    if (hold) this.heldCount++;
     this.writeActive(e);
+    // flush this instance's matrix now — a held chunk won't be re-written by
+    // update() until it releases, so its standing pose must upload immediately.
+    this.activeMeshes[variant].instanceMatrix.needsUpdate = true;
     this.activeMeshes[variant].setColorAt(slot, hotDur > 0 ? e.hotColor : e.baseColor);
     const ic = this.activeMeshes[variant].instanceColor;
     if (ic) ic.needsUpdate = true;
     return true;
+  }
+
+  /** Unlock a held lower layer so it loses support and pancakes onto the pile. */
+  private release(e: Chunk) {
+    e.body.setGravityScale(1, true);
+    e.body.lockTranslations(false, true);
+    e.body.lockRotations(false, true);
+    e.body.setLinvel({ x: e.rlin[0], y: e.rlin[1], z: e.rlin[2] }, true);
+    e.body.setAngvel({ x: e.rang[0], y: e.rang[1], z: e.rang[2] }, true);
+    e.held = false;
+    this.heldCount--;
   }
 
   private writeActive(e: Chunk) {
@@ -366,10 +413,18 @@ export class DebrisSystem {
   }
 
   /**
-   * Voxel-chunk a building into roughly-cubic physics pieces (item 1). A cubic
-   * cell size is derived so tall buildings get multiple vertical layers and
-   * pieces never become tall slivers. Cells are split UNEVENLY and each chunk
-   * gets an irregular non-uniform scale so sizes span small shards to big lumps.
+   * Voxel-chunk a building into roughly-cubic pieces, then bring it down by
+   * PROGRESSIVE COLLAPSE (top-to-bottom pancaking) instead of one outward blast:
+   *   - the struck layer + everything above it lose support first (top-first
+   *     micro-stagger) and drop;
+   *   - each layer BELOW the impact releases a beat later (COLLAPSE.layerDelay)
+   *     so the mass telescopes straight down onto its own footprint.
+   * Held-but-not-yet-released layers are pinned (gravityScale 0 + locked) so the
+   * falling upper mass rests on them until their turn. Lateral splay is tiny
+   * (only the struck layer gets a real sideways punch) — gravity does the work,
+   * so debris piles at the building's feet rather than splaying across town.
+   * A cubic cell size keeps pieces from becoming tall slivers; cells split
+   * unevenly + each chunk gets an irregular non-uniform scale.
    */
   fractureBuilding(
     center: [number, number, number],
@@ -392,8 +447,16 @@ export class DebrisSystem {
     const ys = splitAxis(h, ny);
     const zs = splitAxis(d, nz);
     const baseX = center[0] - w / 2;
-    const baseY = center[1] - h / 2;
+    const baseY = center[1]; // info.center[1] is the building's BASE (ground), spans up to baseY+h
     const baseZ = center[2] - d / 2;
+    const cxr = center[0];
+    const czr = center[2];
+
+    // which layer did the meteor strike? (impact.y ~ contact height)
+    const relY = Math.max(0, Math.min(h, impact.y - baseY));
+    const impactLayer = Math.max(0, Math.min(ny - 1, Math.floor((relY / h) * ny)));
+    const topLayer = ny - 1;
+    const lat = COLLAPSE.scatter * impulse;
     let spawned = 0;
 
     let oy = baseY;
@@ -401,6 +464,17 @@ export class DebrisSystem {
       const ch = ys[iy];
       const py = oy + ch / 2;
       oy += ch;
+
+      // release schedule: struck layer + everything above lose support first
+      // (top-first micro-stagger); layers below release in sequence downward.
+      const delay =
+        iy >= impactLayer
+          ? (topLayer - iy) * COLLAPSE.upStagger
+          : COLLAPSE.releaseBase + (impactLayer - iy) * COLLAPSE.layerDelay;
+      const hold = delay > 1e-4;
+      const releaseAt = this.simTime + delay;
+      const struck = iy === impactLayer;
+
       let ox = baseX;
       for (let ix = 0; ix < nx; ix++) {
         const cw = xs[ix];
@@ -414,36 +488,39 @@ export class DebrisSystem {
 
           // per-chunk non-uniform shrink so pieces don't perfectly re-tile the box
           const cs: [number, number, number] = [
-            cw * (0.7 + Math.random() * 0.28),
-            ch * (0.7 + Math.random() * 0.28),
-            cd * (0.7 + Math.random() * 0.28),
+            cw * (0.72 + Math.random() * 0.26),
+            ch * (0.72 + Math.random() * 0.26),
+            cd * (0.72 + Math.random() * 0.26),
           ];
 
-          _dir.set(px - impact.x, py - impact.y, pz - impact.z);
-          const dist = Math.max(0.7, _dir.length());
-          _dir.normalize();
-          const speed = (impulse * 16) / Math.sqrt(dist);
-          const asym = (Math.random() - 0.5) * jitter * speed;
-          // structural splay: every chunk is shoved OUTWARD from the building's
-          // own vertical axis (more up high) so the whole tower collapses even
-          // when the meteor struck only the top — no standing base stack.
-          _axis.set(px - center[0], 0, pz - center[2]);
+          // Mostly DOWN. Outward-from-axis is tiny (no splay across town). Only
+          // the struck layer gets a real lateral punch away from impact + up ejecta.
+          _axis.set(px - cxr, 0, pz - czr);
           if (_axis.lengthSq() < 0.01) _axis.set(Math.random() - 0.5, 0, Math.random() - 0.5);
           _axis.normalize();
-          const splay = 2.5 + (py - center[1]) * 0.14;
-          const lin: [number, number, number] = [
-            _dir.x * speed + asym + _axis.x * splay,
-            Math.abs(_dir.y) * speed * 0.4 + speed * 0.25 + 1,
-            _dir.z * speed + (Math.random() - 0.5) * jitter * speed + _axis.z * splay,
-          ];
+          let vx = _axis.x * lat + (Math.random() - 0.5) * jitter * 2;
+          let vz = _axis.z * lat + (Math.random() - 0.5) * jitter * 2;
+          let vy = -COLLAPSE.down * (0.4 + Math.random());
+          if (struck) {
+            _dir.set(px - impact.x, 0, pz - impact.z);
+            if (_dir.lengthSq() < 0.01) _dir.set(_axis.x, 0, _axis.z);
+            _dir.normalize();
+            const punch = COLLAPSE.scatterImpact * impulse;
+            vx += _dir.x * punch;
+            vz += _dir.z * punch;
+            vy += COLLAPSE.ejecta * Math.random();
+          }
+          const lin: [number, number, number] = [vx, vy, vz];
           const ang: [number, number, number] = [
-            (Math.random() - 0.5) * 9,
-            (Math.random() - 0.5) * 9,
-            (Math.random() - 0.5) * 9,
+            (Math.random() - 0.5) * COLLAPSE.spin,
+            (Math.random() - 0.5) * COLLAPSE.spin,
+            (Math.random() - 0.5) * COLLAPSE.spin,
           ];
-          // only near/lower chunks glow hot
+          // near chunks glow hot briefly
+          const dist = Math.hypot(px - impact.x, py - impact.y, pz - impact.z);
           const hot = dist < 14 ? 1.2 : 0;
-          if (this.spawnChunk([px, py, pz], cs, color, hotColor, hot, lin, ang)) spawned++;
+          if (this.spawnChunk([px, py, pz], cs, color, hotColor, hot, lin, ang, hold, releaseAt))
+            spawned++;
         }
       }
     }
@@ -461,8 +538,8 @@ export class DebrisSystem {
     _dir.set(pos[0] - impact.x, pos[1] - impact.y, pos[2] - impact.z);
     const dist = Math.max(0.5, _dir.length());
     _dir.normalize();
-    const speed = 34 / Math.sqrt(dist);
-    const lin: [number, number, number] = [_dir.x * speed, Math.abs(speed) * 0.6 + 5, _dir.z * speed];
+    const speed = 20 / Math.sqrt(dist); // calmer than before — heavy debris, less launch
+    const lin: [number, number, number] = [_dir.x * speed, Math.abs(speed) * 0.5 + 4, _dir.z * speed];
     const ang: [number, number, number] = [
       (Math.random() - 0.5) * 12,
       (Math.random() - 0.5) * 12,
@@ -543,16 +620,29 @@ export class DebrisSystem {
     this.simTime = simTime;
     this._dirtyM.fill(false);
     this._dirtyC.fill(false);
+    // While any layer is still pinned mid-collapse, don't bake sleeping chunks:
+    // an upper chunk resting on a held layer would otherwise sleep and freeze in
+    // mid-air before the layers beneath it drop. Baking resumes once the whole
+    // collapse has released. ensureRoom() still enforces the hard cap regardless.
+    const pauseBake = this.heldCount > 0;
     for (let i = this.active.length - 1; i >= 0; i--) {
       const e = this.active[i];
       const v = e.variant;
+      // held (pinned) layer: release when its turn comes, otherwise stand firm.
+      if (e.held) {
+        if (simTime >= e.releaseAt) {
+          this.release(e);
+        } else {
+          continue; // still standing; matrix already uploaded at spawn
+        }
+      }
       const t = e.body.translation();
       if (t.y < CULL_Y) {
         this.cullActive(i);
         this._dirtyM[v] = true;
         continue;
       }
-      if (e.body.isSleeping()) {
+      if (!pauseBake && e.body.isSleeping()) {
         this.bakeActive(i); // settle -> persistent rubble, free the body
         this._dirtyM[v] = true;
         continue;
@@ -585,6 +675,7 @@ export class DebrisSystem {
       }
     }
     this.active.length = 0;
+    this.heldCount = 0;
     for (let v = 0; v < this.variantCount; v++) {
       this.activeFree[v].length = 0;
       for (let i = this.activeCap - 1; i >= 0; i--) this.activeFree[v].push(i);
