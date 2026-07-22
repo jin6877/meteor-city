@@ -173,6 +173,7 @@ export default function App() {
     w.__meteor = {
       ready: () => (engineRef.current?.getStats().buildingsAlive ?? 0) > 0,
       stats: () => engineRef.current?.getStats(),
+      agentPos: () => engineRef.current?.agentSample() ?? null,
       seed: () => seedRef.current,
       drop: (x: number, z: number) => {
         const s = settingsRef.current;

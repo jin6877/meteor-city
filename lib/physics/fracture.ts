@@ -17,53 +17,59 @@ export interface FragmentProto {
 }
 
 export interface FractureTemplate {
+  count: number; // fragment count of this template (for size/zone-proportional detail)
   protos: FragmentProto[];
 }
 
 let cache: FractureTemplate[] | null = null;
+let cacheKey = '';
 
-export function buildFractureCache(
-  variants = 2,
-  fragmentsPerVariant = 12,
-): FractureTemplate[] {
-  if (cache) return cache;
-  const templates: FractureTemplate[] = [];
-  const mat = new MeshStandardMaterial();
-  for (let v = 0; v < variants; v++) {
-    const cube = new BoxGeometry(1, 1, 1);
-    const mesh = new Mesh(cube, mat);
-    const opts = new FractureOptions();
-    opts.fragmentCount = fragmentsPerVariant;
-    opts.fractureMode = 'Convex';
-    opts.fracturePlanes = { x: true, y: true, z: true };
-    const frags = fracture(mesh, opts);
-    const protos: FragmentProto[] = [];
-    for (const f of frags) {
-      const g = f.toGeometry();
-      if (!g.getAttribute('normal')) g.computeVertexNormals();
-      const pos = g.getAttribute('position');
-      const hull = new Float32Array(pos.count * 3);
-      let cx = 0,
-        cy = 0,
-        cz = 0;
-      for (let i = 0; i < pos.count; i++) {
-        const x = pos.getX(i),
-          y = pos.getY(i),
-          z = pos.getZ(i);
-        hull[i * 3] = x;
-        hull[i * 3 + 1] = y;
-        hull[i * 3 + 2] = z;
-        cx += x;
-        cy += y;
-        cz += z;
-      }
-      const inv = pos.count > 0 ? 1 / pos.count : 0;
-      protos.push({ geometry: g, hull, centroid: [cx * inv, cy * inv, cz * inv] });
+function fractureOne(fragmentCount: number, mat: MeshStandardMaterial): FractureTemplate {
+  const cube = new BoxGeometry(1, 1, 1);
+  const mesh = new Mesh(cube, mat);
+  const opts = new FractureOptions();
+  opts.fragmentCount = fragmentCount;
+  opts.fractureMode = 'Convex';
+  opts.fracturePlanes = { x: true, y: true, z: true };
+  const frags = fracture(mesh, opts);
+  const protos: FragmentProto[] = [];
+  for (const f of frags) {
+    const g = f.toGeometry();
+    if (!g.getAttribute('normal')) g.computeVertexNormals();
+    const pos = g.getAttribute('position');
+    const hull = new Float32Array(pos.count * 3);
+    let cx = 0,
+      cy = 0,
+      cz = 0;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i),
+        y = pos.getY(i),
+        z = pos.getZ(i);
+      hull[i * 3] = x;
+      hull[i * 3 + 1] = y;
+      hull[i * 3 + 2] = z;
+      cx += x;
+      cy += y;
+      cz += z;
     }
-    templates.push({ protos });
-    cube.dispose();
+    const inv = pos.count > 0 ? 1 / pos.count : 0;
+    protos.push({ geometry: g, hull, centroid: [cx * inv, cy * inv, cz * inv] });
   }
-  cache = templates;
+  cube.dispose();
+  return { count: frags.length || fragmentCount, protos };
+}
+
+/**
+ * Build one template per requested fragment count (coarse..fine). Small/far
+ * buildings use a coarse template, large/near ones a fine template, so bigger
+ * buildings shatter into more pieces. All runs happen once at load.
+ */
+export function buildFractureCache(counts: number[] = [12, 20]): FractureTemplate[] {
+  const key = counts.slice().sort((a, b) => a - b).join(',');
+  if (cache && cacheKey === key) return cache;
+  const mat = new MeshStandardMaterial();
+  cache = counts.map((c) => fractureOne(c, mat));
+  cacheKey = key;
   return cache;
 }
 

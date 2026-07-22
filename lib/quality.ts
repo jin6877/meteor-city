@@ -12,8 +12,12 @@ export interface QualityPreset {
   tier: Tier;
   debrisCap: number; // global dynamic-fragment cap
   maxFractureBuildings: number; // per-impact fully-fractured building cap
-  fractureFragments: number; // fragments per building (three-pinata fragmentCount)
+  fractureCounts: number[]; // available fragment counts (coarse..fine); cache builds one template each
+  fragmentsCoarse: number; // count used for small/far buildings
+  fragmentsFine: number; // count used for large/near buildings
   treeFactor: number; // multiplier on generated tree count
+  agentCars: number; // roaming vehicles
+  agentPeds: number; // roaming pedestrians
   shadows: boolean;
   shadowMapSize: number;
   dpr: [number, number];
@@ -27,10 +31,14 @@ export interface QualityPreset {
 
 const HIGH: QualityPreset = {
   tier: 'high',
-  debrisCap: 300,
-  maxFractureBuildings: 8,
-  fractureFragments: 12,
+  debrisCap: 340,
+  maxFractureBuildings: 12,
+  fractureCounts: [12, 20],
+  fragmentsCoarse: 12,
+  fragmentsFine: 20,
   treeFactor: 1,
+  agentCars: 46,
+  agentPeds: 64,
   shadows: true,
   shadowMapSize: 2048,
   dpr: [1, 2],
@@ -44,10 +52,14 @@ const HIGH: QualityPreset = {
 
 const LOW: QualityPreset = {
   tier: 'low',
-  debrisCap: 120,
-  maxFractureBuildings: 5,
-  fractureFragments: 8,
+  debrisCap: 130,
+  maxFractureBuildings: 7,
+  fractureCounts: [9],
+  fragmentsCoarse: 9,
+  fragmentsFine: 9,
   treeFactor: 0.5,
+  agentCars: 18,
+  agentPeds: 24,
   shadows: true,
   shadowMapSize: 1024,
   dpr: [1, 1.5],

@@ -72,7 +72,6 @@ export class DebrisSystem {
   private caps: number[] = [];
   private material: MeshStandardMaterial;
   private boxMeshIndex = 0;
-  private protoStart = 1; // meshes[1..] are fracture protos, flattened
   private protoOffsets: number[] = []; // template -> starting mesh index
   private active: Debris[] = [];
   private simTime = 0;
@@ -89,10 +88,12 @@ export class DebrisSystem {
       vertexColors: false,
     });
 
-    const perProto = Math.max(
-      8,
-      Math.ceil(this.cap / Math.max(1, this.templates[0]?.protos.length ?? 12)) + 8,
+    // a single proto can be used by up to (cap / smallestFragmentCount) buildings
+    const minCount = Math.max(
+      1,
+      Math.min(...this.templates.map((t) => t.protos.length || t.count)),
     );
+    const perProto = Math.max(8, Math.ceil(this.cap / minCount) + 8);
 
     // meshes[0] = shared unit box (toppled buildings + chunks), capacity = cap
     const boxGeo = new BoxGeometry(1, 1, 1);
@@ -236,7 +237,25 @@ export class DebrisSystem {
     this.meshes[e.mesh].setMatrixAt(e.slot, _m4);
   }
 
-  /** Core zone: fracture a building into fragment bodies with radial impulse. */
+  /** Pick the cached template whose fragment count is closest to desired. */
+  private pickTemplate(desiredCount: number): number {
+    let best = 0;
+    let bestD = Infinity;
+    for (let i = 0; i < this.templates.length; i++) {
+      const d = Math.abs(this.templates[i].count - desiredCount);
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Core/blast zone: fracture a building into fragment bodies with radial
+   * impulse. desiredCount drives detail — bigger/nearer buildings pass a higher
+   * count so they shatter into more pieces (size/zone-proportional).
+   */
   fractureBuilding(
     center: [number, number, number], // footprint center, base y
     size: [number, number, number], // w,h,d
@@ -245,8 +264,9 @@ export class DebrisSystem {
     impulse: number,
     hotColor: number,
     jitter: number, // 0..1 asymmetry (jagged)
+    desiredCount: number,
   ): number {
-    const templateIdx = Math.floor(Math.random() * this.templates.length);
+    const templateIdx = this.pickTemplate(desiredCount);
     const template = this.templates[templateIdx];
     const meshBase = this.protoOffsets[templateIdx];
     const [w, h, d] = size;

@@ -13,6 +13,7 @@ import { DebrisSystem } from './physics/debrisPool';
 import { spawnMeteorBody, buildMeteorMesh, type MeteorBody } from './physics/meteor';
 import { FXManager } from './fx/impact';
 import { CameraShake } from './fx/cameraShake';
+import { AgentSystem } from './agents';
 import { resolveMeteor, type ResolvedMeteor } from './meteorPresets';
 import { SLOMO_SCALE } from './constants';
 import type { QualityPreset } from './quality';
@@ -34,7 +35,7 @@ interface MeteorEntry {
   velDir: Vector3;
 }
 
-const BASE_BLOOM = 0.5;
+const BASE_BLOOM = 0.25; // Bloom now runs on tone-mapped color; keep the city calm, spike only on impact
 const MAX_CONCURRENT_METEORS = 6;
 
 function disposeObject(root: Object3D) {
@@ -65,6 +66,7 @@ export class Engine {
   private city: CityBuild | null = null;
   private cityModel: CityModel | null = null;
   private statics: StaticColliders | null = null;
+  private agents: AgentSystem | null = null;
 
   private meteors: MeteorEntry[] = [];
   private simTime = 0;
@@ -85,7 +87,7 @@ export class Engine {
     await initRapier();
     this.world = makeWorld();
     this.eventQueue = new RAPIER.EventQueue(true);
-    const templates = buildFractureCache(2, this.quality.fractureFragments);
+    const templates = buildFractureCache(this.quality.fractureCounts);
     this.debris = new DebrisSystem(this.world, {
       cap: this.quality.debrisCap,
       templates,
@@ -107,11 +109,24 @@ export class Engine {
     this.clearMeteors();
     this.debris?.reset();
     this.fx.clearDecals();
+    if (this.agents) {
+      this.root.remove(this.agents.group);
+      this.agents.dispose();
+      this.agents = null;
+    }
 
     this.cityModel = model;
     this.city = build;
     this.statics = addCityColliders(this.world, build);
     this.root.add(build.group);
+
+    // roaming cars + pedestrians on the (now wider) road grid
+    this.agents = new AgentSystem(model, {
+      cars: this.quality.agentCars,
+      peds: this.quality.agentPeds,
+      shadows: this.quality.debrisShadows,
+    });
+    this.root.add(this.agents.group);
   }
 
   setTimeScale(scale: number) {
@@ -186,6 +201,7 @@ export class Engine {
     if (!this.world || !this.ready) return;
     this.stepper.step(delta, this.timeScale, (dt) => this.fixedStep(dt));
     this.syncMeteorMeshes(delta);
+    this.agents?.update(delta * this.timeScale); // slow-mo affects traffic too
     this.shake.apply(camera, delta, this._off);
     this.bloom.value = Math.max(BASE_BLOOM, this.fx.bloomEnergy);
   }
@@ -240,28 +256,36 @@ export class Engine {
   private applyDestruction(impact: Vector3, resolved: ResolvedMeteor) {
     if (!this.city || !this.statics || !this.debris || !this.world) return;
     const { R1, R2 } = resolved;
-    const cores: { id: number; d: number }[] = [];
-    const blasts: number[] = [];
-
+    // Everything within the blast radius R2 gets FRACTURED (not just toppled) —
+    // sorted nearest-first, up to the per-impact cap. Only the overflow (far
+    // edge of a huge blast) falls back to a cheap single-box topple, so "hit but
+    // not broken / passes through" no longer happens.
+    const hit: { id: number; d: number }[] = [];
     for (const info of this.city.infos.values()) {
       if (!info.alive) continue;
       const dx = info.center[0] - impact.x;
       const dz = info.center[2] - impact.z;
       const d = Math.hypot(dx, dz);
-      if (d < R1) cores.push({ id: info.id, d });
-      else if (d < R2) blasts.push(info.id);
+      if (d < R2) hit.push({ id: info.id, d });
     }
-    cores.sort((a, b) => a.d - b.d);
+    hit.sort((a, b) => a.d - b.d);
 
     const maxF = this.quality.maxFractureBuildings;
     const preset = resolved.preset;
     const jitter = preset.id === 'jagged' ? 0.8 : 0.25;
+    const coarse = this.quality.fragmentsCoarse;
+    const fine = this.quality.fragmentsFine;
 
-    for (let i = 0; i < cores.length; i++) {
-      const info = this.city.infos.get(cores[i].id)!;
+    for (let i = 0; i < hit.length; i++) {
+      const c = hit[i];
+      const info = this.city.infos.get(c.id)!;
       this.city.destroyBuilding(info.id);
       this.statics.removeBuilding(this.world, info.id);
       if (i < maxF) {
+        // near/tall buildings shatter into more pieces (size + zone proportional)
+        const tall = info.size[1] > 22;
+        const near = c.d < R1;
+        const desired = near || tall ? fine : coarse;
         this.debris.fractureBuilding(
           info.center,
           info.size,
@@ -270,17 +294,13 @@ export class Engine {
           preset.fragmentImpulse,
           preset.hotDebris,
           jitter,
+          desired,
         );
       } else {
         this.debris.toppleBuilding(info.center, info.size, info.color, impact);
       }
     }
-    for (const id of blasts) {
-      const info = this.city.infos.get(id)!;
-      this.city.destroyBuilding(id);
-      this.statics.removeBuilding(this.world, id);
-      this.debris.toppleBuilding(info.center, info.size, info.color, impact);
-    }
+    this.agents?.reactToImpact(impact, R2 * 1.15);
   }
 
   private syncMeteorMeshes(delta: number) {
@@ -303,6 +323,10 @@ export class Engine {
     }
   }
 
+  agentSample(): [number, number] | null {
+    return this.agents?.sampleCar() ?? null;
+  }
+
   getStats() {
     let alive = 0;
     if (this.city) for (const i of this.city.infos.values()) if (i.alive) alive++;
@@ -321,6 +345,11 @@ export class Engine {
     if (this.city) {
       this.root.remove(this.city.group);
       this.city.dispose();
+    }
+    if (this.agents) {
+      this.root.remove(this.agents.group);
+      this.agents.dispose();
+      this.agents = null;
     }
     this.debris?.dispose();
     // Rapier world has no explicit free in compat; drop references
