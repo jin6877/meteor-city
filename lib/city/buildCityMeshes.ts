@@ -37,6 +37,9 @@ import {
   ASPHALT,
   SIDEWALK,
   BASE_BEVEL,
+  WINDOW_TINT,
+  WINDOW_TINT_COOL,
+  WINDOW_EMISSIVE,
   type MaterialFamily,
 } from '../constants';
 import type { CityModel } from './cityTypes';
@@ -63,6 +66,13 @@ export interface BuildingInfo {
   alive: boolean;
 }
 
+export interface RemovedTree {
+  x: number;
+  z: number;
+  scale: number;
+  leafColor: number;
+}
+
 export interface CityBuild {
   group: Group;
   colliders: BuildingCollider[];
@@ -70,6 +80,7 @@ export interface CityBuild {
   groundTop: number;
   infos: Map<number, BuildingInfo>;
   destroyBuilding: (id: number) => void;
+  removeTreesInRadius: (x: number, z: number, r: number) => RemovedTree[];
   dispose: () => void;
 }
 
@@ -81,11 +92,12 @@ function makeWindowTexture(): CanvasTexture {
   const ctx = c.getContext('2d')!;
   ctx.fillStyle = '#000000';
   ctx.fillRect(0, 0, S, S);
-  // one window pane per texture tile: a lit pane inset inside a dark mullion frame
+  // grayscale window pane inside a dark mullion frame; the sky-blue tint comes
+  // from the material's emissive color so it reads as glass reflecting sky.
   const pad = 10;
-  ctx.fillStyle = '#7d6a4a';
+  ctx.fillStyle = '#8a8a8a';
   ctx.fillRect(pad, pad, S - pad * 2, S - pad * 2);
-  ctx.fillStyle = '#93805c';
+  ctx.fillStyle = '#c8c8c8';
   ctx.fillRect(pad + 3, pad + 3, S - pad * 2 - 6, S - pad * 2 - 6);
   const tex = new CanvasTexture(c);
   tex.wrapS = tex.wrapT = RepeatWrapping;
@@ -322,15 +334,21 @@ export function buildCityMeshes(model: CityModel, treeFactor = 1): CityBuild {
     if (acc.count === 0) continue;
     const geo = track(accumToGeometry(acc));
     const spec = FAMILY[f];
+    const hasWindows = f === 'glass' || f === 'concrete';
     const mat = track(
       new MeshStandardMaterial({
         vertexColors: true,
         roughness: spec.roughness,
         metalness: spec.metalness,
         envMapIntensity: spec.envMapIntensity,
-        emissive: new Color(0xffd9a0),
-        emissiveIntensity: f === 'glass' || f === 'concrete' ? 0.35 : 0,
-        emissiveMap: f === 'glass' || f === 'concrete' ? windowTex : null,
+        // sky-blue glass reflection (DESIGN tone kept — low, not fluorescent)
+        emissive: new Color(f === 'glass' ? WINDOW_TINT : WINDOW_TINT_COOL),
+        emissiveIntensity: hasWindows
+          ? f === 'glass'
+            ? WINDOW_EMISSIVE.glass
+            : WINDOW_EMISSIVE.concrete
+          : 0,
+        emissiveMap: hasWindows ? windowTex : null,
       }),
     );
     const mesh = new Mesh(geo, mat);
@@ -364,6 +382,9 @@ export function buildCityMeshes(model: CityModel, treeFactor = 1): CityBuild {
 
   // ---- trees (two InstancedMeshes: trunk + foliage) ----
   const treeCount = Math.max(0, Math.floor(model.trees.length * treeFactor));
+  let trunks: InstancedMesh | null = null;
+  let foliage: InstancedMesh | null = null;
+  const treeAlive: boolean[] = [];
   if (treeCount > 0) {
     const trunkGeo = track(new CylinderGeometry(0.35, 0.5, 2.4, 6));
     const trunkMat = track(
@@ -375,8 +396,8 @@ export function buildCityMeshes(model: CityModel, treeFactor = 1): CityBuild {
     const foliageMat = track(
       new MeshStandardMaterial({ roughness: 0.85, metalness: 0 }),
     );
-    const trunks = new InstancedMesh(trunkGeo, trunkMat, treeCount);
-    const foliage = new InstancedMesh(foliageGeo, foliageMat, treeCount);
+    trunks = new InstancedMesh(trunkGeo, trunkMat, treeCount);
+    foliage = new InstancedMesh(foliageGeo, foliageMat, treeCount);
     trunks.castShadow = foliage.castShadow = true;
     trunks.receiveShadow = foliage.receiveShadow = true;
     const c = new Color();
@@ -397,6 +418,7 @@ export function buildCityMeshes(model: CityModel, treeFactor = 1): CityBuild {
       );
       foliage.setMatrixAt(i, _m4);
       foliage.setColorAt(i, c.set(t.leafColor));
+      treeAlive.push(true);
     }
     trunks.instanceMatrix.needsUpdate = true;
     foliage.instanceMatrix.needsUpdate = true;
@@ -404,6 +426,30 @@ export function buildCityMeshes(model: CityModel, treeFactor = 1): CityBuild {
     group.add(trunks);
     group.add(foliage);
   }
+
+  // ---- destruction: remove trees inside a blast radius (hide instances) ----
+  const _zero = new Matrix4().makeScale(0, 0, 0);
+  const removeTreesInRadius = (x: number, z: number, r: number): RemovedTree[] => {
+    const removed: RemovedTree[] = [];
+    if (!trunks || !foliage) return removed;
+    const r2 = r * r;
+    for (let i = 0; i < treeCount; i++) {
+      if (!treeAlive[i]) continue;
+      const t = model.trees[i];
+      const dx = t.x - x;
+      const dz = t.z - z;
+      if (dx * dx + dz * dz > r2) continue;
+      treeAlive[i] = false;
+      trunks.setMatrixAt(i, _zero);
+      foliage.setMatrixAt(i, _zero);
+      removed.push({ x: t.x, z: t.z, scale: t.scale, leafColor: t.leafColor });
+    }
+    if (removed.length) {
+      trunks.instanceMatrix.needsUpdate = true;
+      foliage.instanceMatrix.needsUpdate = true;
+    }
+    return removed;
+  };
 
   // ---- destruction: collapse a building's body + roof vertices ----
   const collapseRange = (mesh: Mesh | undefined | null, start: number, count: number, at: Vector3) => {
@@ -444,5 +490,14 @@ export function buildCityMeshes(model: CityModel, treeFactor = 1): CityBuild {
     group.clear();
   };
 
-  return { group, colliders, ground, groundTop: GROUND_TOP, infos, destroyBuilding, dispose };
+  return {
+    group,
+    colliders,
+    ground,
+    groundTop: GROUND_TOP,
+    infos,
+    destroyBuilding,
+    removeTreesInRadius,
+    dispose,
+  };
 }

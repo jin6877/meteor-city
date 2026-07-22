@@ -110,6 +110,13 @@ export const FAMILY: Record<MaterialFamily, FamilySpec> = {
 export const LEAF_COLORS = [0x5e7b4e, 0x6e8a54, 0xa8863c];
 export const TRUNK_COLOR = 0x6a4e3a;
 
+// ---- Windows (sky-blue glass, reflecting the daytime sky) ----
+// tint multiplies the grayscale window emissiveMap; intensity varies by family
+// so it reads as glass reflecting sky, not a uniform fluorescent grid.
+export const WINDOW_TINT = 0xaecadf; // soft sky-blue
+export const WINDOW_TINT_COOL = 0x9fbcd6; // slightly deeper for concrete
+export const WINDOW_EMISSIVE = { glass: 0.5, concrete: 0.28 } as const;
+
 // ---- Physics ----
 export const GRAVITY = -26; // stronger than earth for snappier meteor drop feel
 export const FIXED_DT = 1 / 60; // fixed physics timestep (accumulator)
