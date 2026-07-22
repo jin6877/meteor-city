@@ -60,14 +60,14 @@ function parsing() {
 async function cap() {
   await RAPIER.init();
   const world = makeWorld();
-  const templates = buildFractureCache(2, 12);
+  const templates = buildFractureCache([12, 20]);
   const CAP = 50;
   const debris = new DebrisSystem(world, { cap: CAP, templates, castShadow: false });
   const impact = new Vector3(0, 0, 0);
   let maxSeen = 0;
   // sustained spawning: far more fragments than the cap, over many "impacts"
   for (let i = 0; i < 40; i++) {
-    debris.fractureBuilding([i * 6, 0, 0], [8, 20, 8], 0x888888, impact, 1.0, 0xc24a20, 0.3);
+    debris.fractureBuilding([i * 6, 0, 0], [8, 20, 8], 0x888888, impact, 1.0, 0xc24a20, 0.3, 20);
     debris.toppleBuilding([i * 6 + 3, 0, 3], [8, 20, 8], 0x888888, impact);
     world.step();
     debris.update(i * 0.05);
