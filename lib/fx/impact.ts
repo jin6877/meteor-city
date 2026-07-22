@@ -22,6 +22,7 @@ import {
   Texture,
 } from 'three';
 import type { MeteorPreset } from '../meteorPresets';
+import { SMOKE } from '../constants';
 
 // ---------- textures (generated once) ----------
 function softCircleTex(): Texture {
@@ -269,6 +270,124 @@ class DustPool {
   }
 }
 
+// ---------- rising smoke (dark, long-lived, alpha billboards) ----------
+// Separate from dust: dust is a fast warm puff that falls back; smoke is a dark
+// warm-gray column that RISES off the crater, expands, and slowly disperses
+// (DESIGN §4-3 "먼지 기둥 상승 1~2s" extended). Alpha-blended (not additive) so
+// it reads as smoke, not glow. Its own pooled budget, oldest reused first.
+interface SmokeBurst {
+  points: Points;
+  vel: Float32Array;
+  base: Float32Array;
+  life: number;
+  dur: number;
+  active: boolean;
+}
+class SmokePool {
+  private items: SmokeBurst[] = [];
+  constructor(private group: Group, private tex: Texture, size: number, private perBurst: number) {
+    for (let i = 0; i < size; i++) {
+      const geo = new BufferGeometry();
+      geo.setAttribute('position', new Float32BufferAttribute(new Float32Array(perBurst * 3), 3));
+      const mat = new PointsMaterial({
+        map: tex,
+        size: SMOKE.sizeStart,
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        color: SMOKE.color,
+        // NormalBlending (default) — dark alpha smoke, never additive glow
+      });
+      const p = new Points(geo, mat);
+      p.visible = false;
+      p.frustumCulled = false;
+      this.group.add(p);
+      this.items.push({
+        points: p,
+        vel: new Float32Array(perBurst * 3),
+        base: new Float32Array(perBurst * 3),
+        life: 0,
+        dur: 1,
+        active: false,
+      });
+    }
+  }
+  fire(pos: [number, number, number], amount: number, cool: boolean) {
+    const it = this.items.find((i) => !i.active) ?? this.items[0];
+    it.active = true;
+    it.points.visible = true;
+    it.life = 0;
+    it.dur = SMOKE.life * (0.9 + Math.random() * 0.3);
+    const mat = it.points.material as PointsMaterial;
+    mat.color.set(cool ? SMOKE.colorCool : SMOKE.color);
+    mat.size = SMOKE.sizeStart;
+    mat.opacity = 0;
+    const attr = it.points.geometry.getAttribute('position') as Float32BufferAttribute;
+    const n = Math.min(this.perBurst, Math.max(6, Math.floor(this.perBurst * Math.min(1.4, amount))));
+    for (let i = 0; i < this.perBurst; i++) {
+      if (i < n) {
+        const ang = Math.random() * Math.PI * 2;
+        const rad = Math.random() * SMOKE.spread;
+        it.base[i * 3] = pos[0] + Math.cos(ang) * rad;
+        it.base[i * 3 + 1] = pos[1] + Math.random() * SMOKE.seedColumn; // seed a short column
+        it.base[i * 3 + 2] = pos[2] + Math.sin(ang) * rad;
+        // mostly-up velocity with variance (elongates the plume), slight lateral drift
+        it.vel[i * 3] = Math.cos(ang) * SMOKE.drift * (0.3 + Math.random() * 0.7);
+        it.vel[i * 3 + 1] = SMOKE.rise + Math.random() * SMOKE.riseJitter;
+        it.vel[i * 3 + 2] = Math.sin(ang) * SMOKE.drift * (0.3 + Math.random() * 0.7);
+      } else {
+        it.base[i * 3] = it.base[i * 3 + 1] = it.base[i * 3 + 2] = 99999;
+        it.vel[i * 3] = it.vel[i * 3 + 1] = it.vel[i * 3 + 2] = 0;
+      }
+      attr.setXYZ(i, it.base[i * 3], it.base[i * 3 + 1], it.base[i * 3 + 2]);
+    }
+    attr.needsUpdate = true;
+  }
+  update(dt: number) {
+    for (const it of this.items) {
+      if (!it.active) continue;
+      it.life += dt;
+      const t = it.life / it.dur;
+      const mat = it.points.material as PointsMaterial;
+      if (t >= 1) {
+        it.active = false;
+        it.points.visible = false;
+        mat.opacity = 0;
+        continue;
+      }
+      // ramp in fast, HOLD near peak (so the column reads), then a long slow fade
+      const a =
+        t < 0.1
+          ? t / 0.1
+          : t < SMOKE.hold
+            ? 1
+            : 1 - (t - SMOKE.hold) / (1 - SMOKE.hold);
+      mat.opacity = Math.max(0, a) * SMOKE.peakAlpha;
+      mat.size = SMOKE.sizeStart + (SMOKE.sizeEnd - SMOKE.sizeStart) * t;
+      const attr = it.points.geometry.getAttribute('position') as Float32BufferAttribute;
+      for (let i = 0; i < this.perBurst; i++) {
+        if (it.base[i * 3] > 90000) continue;
+        it.vel[i * 3 + 1] *= 1 - 0.12 * dt; // buoyancy slowly bleeds off
+        it.vel[i * 3] *= 1 + 0.25 * dt; // drift out as it dissipates
+        it.vel[i * 3 + 2] *= 1 + 0.25 * dt;
+        it.base[i * 3] += it.vel[i * 3] * dt;
+        it.base[i * 3 + 1] += it.vel[i * 3 + 1] * dt;
+        it.base[i * 3 + 2] += it.vel[i * 3 + 2] * dt;
+        attr.setXYZ(i, it.base[i * 3], it.base[i * 3 + 1], it.base[i * 3 + 2]);
+      }
+      attr.needsUpdate = true;
+    }
+  }
+  clear() {
+    for (const it of this.items) {
+      it.active = false;
+      it.points.visible = false;
+      (it.points.material as PointsMaterial).opacity = 0;
+    }
+  }
+}
+
 // ---------- decals (crater/scorch ring buffer) ----------
 class DecalPool {
   private meshes: Mesh[] = [];
@@ -314,23 +433,33 @@ class DecalPool {
   }
 }
 
+export interface FXOptions {
+  lowTier?: boolean;
+  dustPerBurst?: number;
+}
+
 export class FXManager {
   readonly group = new Group();
   private flashes: FlashPool;
   private rings: RingPool;
   private dust: DustPool;
+  private smoke: SmokePool;
   private decals: DecalPool;
   private soft: Texture;
   private ring: Texture;
   bloomEnergy = 0; // decays each frame; Engine maps to Bloom intensity
 
-  constructor(dustPerBurst = 48) {
+  constructor(opts: FXOptions = {}) {
+    const low = opts.lowTier ?? false;
+    const dustPerBurst = opts.dustPerBurst ?? 48;
     this.group.name = 'fx';
     this.soft = softCircleTex();
     this.ring = ringTex();
     this.flashes = new FlashPool(this.group, this.soft, 8);
     this.rings = new RingPool(this.group, this.ring, 8);
     this.dust = new DustPool(this.group, this.soft, 10, dustPerBurst);
+    // smoke budget is SEPARATE from debris/rubble and scales with tier
+    this.smoke = new SmokePool(this.group, this.soft, low ? 6 : 8, low ? 26 : 40);
     this.decals = new DecalPool(this.group, 28);
   }
 
@@ -348,10 +477,14 @@ export class FXManager {
       this.rings.fire(point, R2, 0xbfe0ea);
       this.dust.fire(point, 0xcfe2e8, preset.dustAmount * 1.3, true); // splash
       this.dust.fire([point[0], point[1] + 1, point[2]], 0xdff1f7, 0.6, true);
+      // over water -> a pale, thin steam wisp rather than dark smoke
+      this.smoke.fire(point, preset.dustAmount * 0.5, true);
     } else {
       this.flashes.fire(point, preset.flashColor, flashScale, preset.flashIntensity);
       this.rings.fire(point, R2, 0xf5ead8);
       this.dust.fire(point, preset.dustColor, preset.dustAmount, preset.dustCool);
+      // rising smoke column off the impact/crater — bigger blasts smoke more
+      this.smoke.fire(point, 0.7 + preset.dustAmount * 0.5, preset.dustCool);
     }
     this.bloomEnergy = Math.max(this.bloomEnergy, preset.bloomSpike);
   }
@@ -371,11 +504,17 @@ export class FXManager {
     this.flashes.update(dt);
     this.rings.update(dt);
     this.dust.update(dt);
+    this.smoke.update(dt);
     // bloom energy decays back toward 0 (Engine lerps actual bloom toward base)
     this.bloomEnergy = Math.max(0, this.bloomEnergy - dt * 2.2);
   }
 
   clearDecals() {
     this.decals.clear();
+  }
+
+  /** Drop any in-flight smoke (used on city reset/regenerate). */
+  clearSmoke() {
+    this.smoke.clear();
   }
 }

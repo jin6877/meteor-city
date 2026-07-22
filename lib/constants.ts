@@ -117,6 +117,25 @@ export const WINDOW_TINT = 0xaecadf; // soft sky-blue
 export const WINDOW_TINT_COOL = 0x9fbcd6; // slightly deeper for concrete
 export const WINDOW_EMISSIVE = { glass: 0.5, concrete: 0.28 } as const;
 
+// ---- Rising smoke (impact residue — separate budget from debris/rubble) ----
+// A dark warm-gray column that rises off the crater and slowly disperses. Kept
+// restrained (low alpha, expands + fades) for the diorama tone — NOT photoreal
+// thick smoke (DESIGN §7 Don't). All knobs live here for easy tuning.
+export const SMOKE = {
+  color: 0x4c4842, // dark warm gray (diorama smoke, never pure black)
+  colorCool: 0x8b9496, // comet / over-water: paler cool wisp
+  rise: 3.2, // base upward speed (world units/s)
+  riseJitter: 1.8, // per-particle rise variance (elongates the plume)
+  seedColumn: 3.6, // initial vertical seed spread (starts as a short column)
+  spread: 1.4, // initial horizontal seed radius (tight = column)
+  drift: 1.0, // lateral drift speed as it disperses
+  life: 5.5, // seconds — lingers well past the fast dust
+  hold: 0.5, // fraction of life held near peak before the slow fade
+  peakAlpha: 0.46, // restrained but readable (miniature tone, still translucent)
+  sizeStart: 6, // billboard size at birth
+  sizeEnd: 16, // billboard size at death (puff expands as it dissipates)
+} as const;
+
 // ---- Physics ----
 export const GRAVITY = -26; // stronger than earth for snappier meteor drop feel
 export const FIXED_DT = 1 / 60; // fixed physics timestep (accumulator)

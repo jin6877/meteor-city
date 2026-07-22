@@ -62,7 +62,7 @@ function disposeObject(root: Object3D) {
 
 export class Engine {
   readonly root = new Group();
-  readonly fx = new FXManager();
+  readonly fx: FXManager;
   readonly shake = new CameraShake();
   readonly bloom = { value: BASE_BLOOM };
 
@@ -90,6 +90,7 @@ export class Engine {
 
   constructor(quality: QualityPreset) {
     this.quality = quality;
+    this.fx = new FXManager({ lowTier: quality.tier === 'low' });
     this.root.name = 'engine-root';
     this.root.add(this.fx.group);
   }
@@ -119,6 +120,7 @@ export class Engine {
     this.clearMeteors();
     this.debris?.reset();
     this.fx.clearDecals();
+    this.fx.clearSmoke();
     if (this.agents) {
       this.root.remove(this.agents.group);
       this.agents.dispose();
@@ -210,6 +212,7 @@ export class Engine {
     this.clearMeteors();
     this.debris?.reset();
     this.fx.clearDecals();
+    this.fx.clearSmoke();
   }
 
   // ---- main loop ----
