@@ -67,16 +67,20 @@ export default function App() {
 
   const engineRef = useRef<Engine | null>(null);
   const settingsRef = useRef<{ type: MeteorType; size: MeteorSize }>({ type, size });
+  const seedRef = useRef<number>(1);
   const toastTimer = useRef<number>(0);
   const quality = useMemo(() => {
     const forced = (loadPref('mc:tier') as Tier | null) ?? undefined;
     return detectQuality(forced === 'high' || forced === 'low' ? forced : undefined);
   }, []);
 
-  // keep the drop-handler's snapshot of type/size current without mutating during render
+  // keep the drop-handler's snapshot of type/size/seed current without mutating during render
   useEffect(() => {
     settingsRef.current = { type, size };
   }, [type, size]);
+  useEffect(() => {
+    seedRef.current = seed;
+  }, [seed]);
 
   const flashToast = useCallback((msg: string) => {
     setToast(msg);
@@ -162,14 +166,14 @@ export default function App() {
     window.history.replaceState(null, '', url);
   }, [seed, type, size, phase]);
 
-  // ---- debug hook for automated verification ----
+  // ---- debug hook for automated verification (set once, reads live state) ----
   useEffect(() => {
     if (phase !== 'ready') return;
     const w = window as unknown as Record<string, unknown>;
     w.__meteor = {
-      ready: () => !!engineRef.current?.ready && !!model,
+      ready: () => (engineRef.current?.getStats().buildingsAlive ?? 0) > 0,
       stats: () => engineRef.current?.getStats(),
-      seed: () => seed,
+      seed: () => seedRef.current,
       drop: (x: number, z: number) => {
         const s = settingsRef.current;
         engineRef.current?.dropMeteor(new Vector3(x, 0.3, z), s.type, s.size);
@@ -177,9 +181,9 @@ export default function App() {
       setSlomo: (on: boolean) => engineRef.current?.toggleSlomo(on),
     };
     return () => {
-      delete w.__meteor;
+      if (w.__meteor) delete w.__meteor;
     };
-  }, [phase, model, seed]);
+  }, [phase]);
 
   // ---- HUD idle auto-fade (keep capture clean, DESIGN §6) ----
   useEffect(() => {

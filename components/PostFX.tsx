@@ -7,7 +7,7 @@
  * intensity is driven each frame from engine.bloom.value for the impact spike.
  */
 import { useFrame } from '@react-three/fiber';
-import { useRef } from 'react';
+import { useCallback, useRef } from 'react';
 import {
   EffectComposer,
   Bloom,
@@ -33,7 +33,14 @@ export default function PostFX({
   engine: Engine;
   quality: QualityPreset;
 }) {
-  const bloomRef = useRef<BloomEffect>(null);
+  const bloomRef = useRef<BloomEffect | null>(null);
+  // React 19 puts `ref` in props, and @react-three/postprocessing JSON.stringifies
+  // Bloom's props for memoization. An object ref -> BloomEffect (circular
+  // parent/children) throws "circular structure" and crashes React. A callback
+  // ref is a function, which JSON.stringify omits, so it is safe + stable.
+  const setBloom = useCallback((e: BloomEffect | null) => {
+    bloomRef.current = e;
+  }, []);
 
   useFrame(() => {
     if (bloomRef.current) {
@@ -66,7 +73,7 @@ export default function PostFX({
 
       {quality.bloom ? (
         <Bloom
-          ref={bloomRef}
+          ref={setBloom}
           intensity={0.5}
           luminanceThreshold={0.85}
           luminanceSmoothing={0.12}
