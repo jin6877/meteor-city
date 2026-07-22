@@ -79,7 +79,10 @@ const ARCH_FAMILY: Record<Archetype, MaterialFamily> = {
 
 export function generateCity(seed: number): CityModel {
   const rng = new Rng(seed >>> 0);
-  const gridN = rng.int(6, 10);
+  // wider city (bigger grid = more blocks/roads/buildings). Kept seed-derived
+  // (NOT tier-derived) so a shared ?seed= reproduces the same city on every
+  // device; tiers scale only render cost (trees, debris cap, agents, AO).
+  const gridN = rng.int(8, 12);
   const pitch = CELL + ROAD;
   const span = gridN * pitch + ROAD;
   const half = span / 2;

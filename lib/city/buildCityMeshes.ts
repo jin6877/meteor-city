@@ -370,8 +370,10 @@ export function buildCityMeshes(model: CityModel, treeFactor = 1): CityBuild {
       new MeshStandardMaterial({ color: TRUNK_COLOR, roughness: 0.9, metalness: 0 }),
     );
     const foliageGeo = track(new ConeGeometry(1.5, 3.4, 7));
+    // per-instance leaf color comes from instanceColor (setColorAt), NOT vertex
+    // colors — enabling vertexColors with no color attribute renders black.
     const foliageMat = track(
-      new MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0 }),
+      new MeshStandardMaterial({ roughness: 0.85, metalness: 0 }),
     );
     const trunks = new InstancedMesh(trunkGeo, trunkMat, treeCount);
     const foliage = new InstancedMesh(foliageGeo, foliageMat, treeCount);
